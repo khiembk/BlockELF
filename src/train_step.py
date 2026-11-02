@@ -11,6 +11,7 @@ from utils.sampling_utils import (
     sample_cfg_scale, add_noise, sample_timesteps,
     net_out_to_v_x, restore_cond,
 )
+from utils.block_utils import sample_block_round
 
 
 Array = jnp.ndarray
@@ -36,8 +37,8 @@ def train_step(
     (
         t_rng, noise_rng, self_cond_mask_rng, self_cond_cfg_rng,
         model_dropout_rng, decoder_step_rng, decoder_rng,
-        decoder_lambda_rng, decoder_noise_rng,
-    ) = jax.random.split(current_step_rng, 9)
+        decoder_lambda_rng, decoder_noise_rng, block_rng,
+    ) = jax.random.split(current_step_rng, 10)
 
     # encoder_attention_mask: cond sees cond, x sees all
     encoder_attention_mask = batch["encoder_attention_mask"]
@@ -78,7 +79,20 @@ def train_step(
         loss_mask = jnp.ones_like(attention_mask)
     loss_mask = loss_mask * (1 - batch["cond_seq_mask"])
 
-    denoiser_z = add_noise(x0, noise, t, config, cond_seq_mask=cond_seq_mask)
+    # Block-to-block (fixed-commitment) revelation: teacher-force a committed target
+    # prefix {1,...,k*b} this round and restrict noise/loss to the remaining ("active")
+    # target positions. `clean_mask` generalizes `cond_seq_mask` (source-only) to also
+    # cover the committed target prefix; everywhere else keeps using `cond_seq_mask`
+    # unchanged (e.g. CFG label-drop below only ever drops the source sentence).
+    clean_mask = cond_seq_mask
+    if config.use_block_revelation:
+        committed_mask_2d, active_mask_2d, _ = sample_block_round(
+            block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
+        )
+        clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
+        loss_mask = active_mask_2d
+
+    denoiser_z = add_noise(x0, noise, t, config, cond_seq_mask=clean_mask)
 
     drop = batch["label_drop_mask"][:, None]
     if config.label_drop_prob > 0:
@@ -121,7 +135,7 @@ def train_step(
         # Self-conditioning: with probability self_cond_prob, compute initial estimate
         if self_cond_prob == 0:
             return z
-        z_uncond = restore_cond(jnp.zeros_like(z), x_tokens, cond_seq_mask)
+        z_uncond = restore_cond(jnp.zeros_like(z), x_tokens, clean_mask)
         z_with_zeros = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_init = state.apply_fn(
             {"params": params}, z_with_zeros, t_input,
@@ -130,9 +144,9 @@ def train_step(
         )
         net_out_init = jax.lax.stop_gradient(net_out_init)
         _, x_pred_init = net_out_to_v_x(net_out_init, z, t_input, t_eps)
-        x_pred_init = restore_cond(x_pred_init, x_tokens, cond_seq_mask)
+        x_pred_init = restore_cond(x_pred_init, x_tokens, clean_mask)
         x_pred_cond = x_pred_init * use_self_cond_mask.astype(z.dtype)
-        x_pred_cond = restore_cond(x_pred_cond, x_tokens, cond_seq_mask)
+        x_pred_cond = restore_cond(x_pred_cond, x_tokens, clean_mask)
         return jnp.concatenate([z, x_pred_cond], axis=-1)
 
     def reduce_token_loss(per_token_loss, loss_mask):
@@ -164,7 +178,7 @@ def train_step(
     def get_sc_guided_v(params, z, t, base_v_target, x_tokens):
         """v target with self-conditioning guidance."""
         v_cond, v_uncond = get_sc_cond_and_uncond(
-            params, z, t, cond_mask=cond_seq_mask, x_tokens=x_tokens
+            params, z, t, cond_mask=clean_mask, x_tokens=x_tokens
         )
         sc_w = self_cond_cfg_scale.reshape(batch_size, 1, 1)
         sc_guidance = (1 - 1 / sc_w) * (v_cond - v_uncond)
@@ -264,5 +278,6 @@ def train_step(
         "loss": loss,
         "l2_loss": active_l2_loss_val,
         "ce_loss": active_ce_loss_val,
+        "active_frac": jax.lax.pmean(loss_mask.mean(), axis_name="batch"),
     }
     return new_state, metrics

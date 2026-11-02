@@ -1,0 +1,382 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=0.90in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,microtype}
+\usepackage{amsmath,amssymb,mathtools,amsthm}
+\usepackage{booktabs,tabularx,array}
+\usepackage{algorithm,algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xurl}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\definecolor{navy}{HTML}{17324F}
+\definecolor{muted}{HTML}{546474}
+\definecolor{light}{HTML}{F1F5F8}
+\hypersetup{colorlinks=true,linkcolor=navy,urlcolor=navy,citecolor=navy}
+\setlist[itemize]{leftmargin=*,itemsep=2pt,topsep=4pt}
+\setlist[enumerate]{leftmargin=*,itemsep=2pt,topsep=4pt}
+\setlength{\parskip}{3pt}
+\setlength{\parindent}{0pt}
+\pagestyle{fancy}\fancyhf{}\fancyhead[L]{\small\color{muted} Adaptive BlockFlow --- technical specification}\fancyhead[R]{\small\color{muted} Working draft, October 2026}\fancyfoot[C]{\thepage}
+\titleformat{\section}{\large\bfseries\color{navy}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\normalsize\bfseries\color{navy}}{\thesubsection}{0.7em}{}
+\newcommand{\C}{\mathcal C}
+\newcommand{\A}{\mathcal A}
+\newcommand{\Sset}{\mathcal S}
+\newcommand{\V}{\mathcal V}
+\newcommand{\E}{\mathbb E}
+\newcommand{\N}{\mathcal N}
+\newcommand{\Cat}{\operatorname{Cat}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\stopgrad}{\operatorname{sg}}
+\newcommand{\NFE}{\operatorname{NFE}}
+\newcommand{\CE}{\operatorname{CE}}
+\newcommand{\mask}{\operatorname{mask}}
+\newcommand{\KL}{\operatorname{KL}}
+\lstdefinestyle{compact}{basicstyle=\ttfamily\small,backgroundcolor=\color{light},frame=single,rulecolor=\color{muted!20},breaklines=true,breakatwhitespace=true,columns=fullflexible,showstringspaces=false}
+\lstset{style=compact}
+\title{\vspace{-1.0cm}\textbf{Adaptive BlockFlow}\\[3pt]
+\large All-Remaining-Token Categorical Flow Matching\\with Reinforcement-Learned Token Revelation\\[9pt]
+\normalsize Technical Specification and Implementation Contract}
+\author{Research working draft --- for review and implementation}
+\date{October 2026 \quad | \quad Version 4: Gaussian-to-categorical VFM}
+\begin{document}
+\maketitle
+\vspace{-0.7cm}
+\begin{abstract}
+We propose \emph{Adaptive BlockFlow}, a two-stage conditional translation model. Unlike conventional block diffusion, the generator predicts \emph{every as-yet-uncommitted target position} during each generation round. Stage~1 commits only a fixed number $b$ of these candidate tokens; Stage~2 learns an adaptive subset-selection policy via group-relative policy optimization (GRPO). The generative process adopts the \emph{Gaussian-to-categorical} formulation of Categorical Flow Maps: data tokens are represented as one-hot vocabulary vectors, noisy trajectories are \emph{continuous}, and a transformer predicts a categorical endpoint distribution supervised by variational flow matching (VFM). We use Set Diffusion's set-causal attention and incremental-caching ideas as an architectural starting point, and the official Categorical Flow Maps text implementation as a reference for the Gaussian-input projection, VFM objective, and solver. This report describes a proposed algorithm, not a claim that the published repositories already provide its combined implementation. No flow-map self-distillation, one-step distillation, or few-step distillation objective is included.
+\end{abstract}
+\vspace{0.2cm}
+\tableofcontents
+\newpage
+
+\section{Non-negotiable algorithmic contract}
+\textbf{Core rule:} on revelation round $k$, run conditional flow generation on the \emph{entire remaining target set} $\A_k$. The generator outputs candidate tokens for all $i\in\A_k$. Commit only $\Sset_k\subseteq\A_k$ and discard the other candidates. Previously committed tokens never change.
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}p{0.26\linewidth}X@{}}\toprule
+Element & Required behavior \\ \midrule
+Task & WMT14 German $\rightarrow$ English; source sentence fixed and always visible. \\
+Noise & Independent Gaussian noise per \emph{uncommitted} target position, $z_0^i\sim\N(0,I_V)$; not a $[\mathrm{MASK}]$ token or a uniformly sampled vocabulary ID. \\
+Prediction & Categorical distributions over vocabulary items at \emph{all} $i\in\A_k$. \\
+Stage 1 & Train with conditional VFM over all $\A_k$; inference commits $\min(b,|\A_k|)$ positions in a predetermined order. \\
+Stage 2 & Freeze generator initially; a learned policy selects both subset cardinality and token positions with GRPO. \\
+Attention & All active positions may interact; committed context must not depend on unrevealed noisy positions. \\
+Caching & Functional correctness first, uncached; cache only invariant clean-context states after parity tests. \\
+Scope exclusion & No flow-map self-distillation or one-/few-step distillation training. \\ \bottomrule
+\end{tabularx}
+\end{center}
+\textbf{Terminology:} the training data and endpoint predictions are categorical, but the intermediate flow states $z_t$ are \emph{continuous} in $\mathbb R^V$. Thus our chosen model is a \emph{continuous Gaussian-to-categorical variational flow} for discrete text, not a discrete-state continuous-time Markov chain. This follows the underlying VFM construction of Roos et al.~\cite{roos2026}.
+
+\section{Motivation and relation to prior work}
+Standard Block Diffusion generates and denoises a current block, then moves to the next. Our Stage~1 deliberately differs: it solves a flow problem over \emph{all remaining positions} each round, even though it adds only $b$ tokens to context. Stage~2 learns the subset selection rule. Set Diffusion \cite{arriola2026} supplies relevant set-causal ordering and KV-cache ideas, but the existing implementation is masked discrete diffusion, not our continuous Gaussian-to-categorical generator. Categorical Flow Maps \cite{roos2026} supplies the flow path, endpoint prediction, and VFM loss, but does not supply the proposed revelation-controller training and WMT14 conditional architecture.
+
+\paragraph{Software references (not drop-in compatibility).}
+\begin{itemize}
+\item \textbf{Set Diffusion:} \url{https://github.com/kuleshov-group/setdlms}. Reuse/refine its backbone, set-order masks, cache logic, and evaluation infrastructure after inspecting real APIs.
+\item \textbf{Categorical Flow Maps (text implementation):} \url{https://github.com/olsdavis/semicat}. Inspect \texttt{semicat/models/semicat.py} and \texttt{semicat/models/textsemicat.py} for Gaussian priors, continuous-input embeddings, time conditioning, VFM, and basic sampling; disable the repository's self-distillation path for our initial experiments.
+\item \textbf{Training from scratch:} no ELF checkpoint; no assumption that a Set Diffusion or Semicat pretrained checkpoint is compatible with the combined architecture.
+\end{itemize}
+
+\section{Notation and conditional generation semantics}
+Given a German sentence $s$, let $y=(y_1,\ldots,y_L)$ be the target English token sequence including an EOS token, with token alphabet $\V$ of size $V$. Denote one-hot token vectors by $e(y_i)\in\{e_1,\ldots,e_V\}\subset\mathbb R^V$.
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lX@{}}\toprule
+Symbol & Definition \\ \midrule
+$\mathcal U=\{1,\dots,L_{\rm canvas}\}$ & Allocated target canvas; generated without reading reference length at test time. \\
+$\C_k$ & Permanently committed target positions before round $k$. \\
+$\A_k=\mathcal U\setminus\C_k$ & All remaining target positions on round $k$. \\
+$\Sset_k\subseteq\A_k$ & Positions newly committed at the end of round $k$. \\
+$z_t^{\A_k}$ & Continuous noisy states for all remaining positions at flow time $t$. \\
+$p_\theta^i(\cdot\mid z_t^{\A_k},t,s,y_{\C_k})$ & Categorical endpoint distribution for position $i\in\A_k$. \\
+$\widehat y_{\A_k}$ & Candidate token IDs sampled/decoded from final flow endpoints. \\
+$\pi_\phi$ & RL policy over nonempty subsets of $\A_k$ (and therefore their sizes). \\
+$T$ & Number of network evaluations/solver steps in one complete flow solve (subject to solver details). \\
+\bottomrule
+\end{tabularx}
+\end{center}
+For training, $\mathcal U$ contains only valid reference positions up to EOS (plus padding excluded from loss). During inference, $L_{\rm canvas}$ is chosen by a source-only length convention, never from the reference translation. We must explicitly reconcile variable-length output with EOS and canvas limits (Section~\ref{sec:length}).
+
+\section{Gaussian-to-categorical variational flow matching}
+\subsection{Noise and probability path}
+For an active target position $i\in\A$ with clean one-hot endpoint $x_1^i=e(y_i)$, draw independent Gaussian noise $x_0^i\sim\N(0,I_V)$ and time $t\sim\mathrm{Uniform}(0,1)$. Define the \emph{continuous} interpolant
+\begin{equation}
+\boxed{z_t^i=(1-t)x_0^i+t e(y_i),\qquad i\in\A.}\label{eq:interpolant}
+\end{equation}
+The source and committed tokens remain clean; do \emph{not} interpolate them and do \emph{not} allow their representations to absorb information from the current noisy target positions. The model predicts endpoint distributions
+\begin{equation}
+\boxed{p_\theta^i=\softmax\!\left(f_\theta(z_t^{\A},t,s,y_{\C})_i\right)\in\Delta^{V-1},\quad i\in\A.}\label{eq:endpoint}
+\end{equation}
+This produces vocabulary logits through a standard vocabulary projection. It is not a separate, second text decoder network. The \emph{input} differs from ordinary discrete-token diffusion: uncommitted states are continuous $V$-dimensional vectors, requiring a dedicated stable continuous-input projection to transformer hidden width $d$ (informed by Appendix~G.1 of \cite{roos2026}). The \emph{clean source/committed} tokens can use normal token-embedding lookup.
+
+\subsection{Conditional VFM objective}
+The VFM endpoint loss over \emph{all remaining target positions} is
+\begin{equation}
+\boxed{
+\mathcal L_{\mathrm{VFM}}(\theta)=
+\E_{(s,y),\C,t,x_0}\left[-\frac{1}{|\A|}\sum_{i\in\A}
+\log p_\theta^i\left(y_i\mid z_t^{\A},t,s,y_{\C}\right)\right],
+\qquad \A=\mathcal U\setminus\C.}
+\label{eq:loss}
+\end{equation}
+Padding, source tokens, and committed tokens are excluded from the target loss. For all valid $i\in\A$, the supervision is used, even if $i$ will \emph{not} be among the next $b$ committed positions. No self-distillation loss is needed to define or train this VFM model.
+
+\subsection{Instantaneous-flow sampler (no distillation)}
+The endpoint prediction induces the continuous velocity field (for $t<1$)
+\begin{equation}
+\boxed{v_\theta(z_t,t\mid s,y_{\C})
+=\frac{p_\theta(z_t,t\mid s,y_{\C})-z_t}{1-t}.}\label{eq:velocity}
+\end{equation}
+With grid $0=t_0<\cdots<t_N=1$, an explicit Euler step for remaining positions is
+\begin{equation}
+z_{t_{n+1}}^{\A}=z_{t_n}^{\A}+
+\frac{t_{n+1}-t_n}{1-t_n}
+\left(p_\theta(z_{t_n}^{\A},t_n\mid s,y_\C)-z_{t_n}^{\A}\right).
+\label{eq:euler}
+\end{equation}
+The last step of this schedule transports $z_{t_{N-1}}$ to the predicted simplex-valued endpoint. Sample candidate token IDs as $\widehat y_i\sim\Cat(z_1^i)$ (or use argmax as a deterministic baseline). Numerical details must be validated against the VFM-only solver, with stable denominators and explicit reporting of the actual number of network calls. Equation~\eqref{eq:euler} is an \emph{instantaneous velocity} sampler, not a learned interval flow-map or a distillation method.
+
+\section{Stage 1: all-remaining-token generation with fixed commitment}
+\subsection{Context distribution during training}
+Let $b\ge1$ be the fixed commitment size. For left-to-right training, sample a reveal-round index $k$ and form
+\begin{equation}
+\C_k=\{1,\ldots,\min(kb,L)\},\qquad
+\A_k=\{1,\ldots,L\}\setminus\C_k.
+\end{equation}
+On the resulting context, construct Gaussian-to-data paths for \emph{every} $i\in\A_k$ using Equation~\eqref{eq:interpolant}, and optimize Equation~\eqref{eq:loss}. The context is teacher-forced clean target tokens during initial supervised training. It must not receive information from the unrevealed reference tokens via attention or cached hidden states.
+
+
+\begin{algorithm}[htbp]
+\caption{Stage 1 training}\label{alg:train}
+\begin{algorithmic}[1]
+\Require The dataset $\mathcal{D}$, size $b$, denoiser $p_\theta$
+\State Choose left-to-right ordering.
+\State Sample $\bm{x} = [\bm{x}_1, \ldots, \bm{x}_{L}] \sim \mathcal{D}$
+\State For each step $k$; obtain $\C_k = \{1,\ldots, kb\}$ and $\A_k= \{kb+1, L\}$
+\State Sample $t\sim U(0,1)$ and $\bm{\epsilon}^i\sim\N(0,I_V)$ for \textbf{all} $i\in\A_k$
+\State $x_i(t)\gets(1-t)\bm{\epsilon}^i+t (\bm{x}_i)$ for \textbf{all} $i\in\A_k$
+\State Predict vocabulary distributions $p_\theta^i$ at all $i\in\A_k$
+\State $\ell\gets-|\A_k|^{-1}\sum_{i\in\A_k}\log p_\theta^i(x_i\mid x_i(t), \bm{x}_{c})$
+\State Update $\theta$ using $\nabla_\theta\ell$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Stage 1 inference: fixed $b$ committed each round}
+A \emph{complete flow solve} is performed for $\A_k$ on every round, from fresh Gaussian noise (initial baseline). Once candidate IDs for all $i\in\A_k$ are obtained, commit exactly the next $\min(b,|\A_k|)$ valid positions and discard candidates elsewhere. Later rounds predict all remaining positions again.
+\begin{algorithm}[htbp]
+\caption{Stage 1 inference: all remaining flow, fixed commitment}\label{alg:infer}
+\begin{algorithmic}[1]
+\Require commit size $b$, flow steps $T$
+\State $\C\gets\varnothing$; committed tokens $\bm{x}_c\gets\varnothing$, $\A \gets \{1, \ldots,L \}$
+\While{$\A\ne\varnothing$}
+  \State Sample $\bm{x}_i(0)\sim\N(0,I_V)$ for \textbf{all} $i\in\A$
+  \State Update flow on \textbf{all} $\A$ for $T$ evaluations
+  \begin{align}
+      \nonumber \bm{x}_{i}(t + \Delta t) = \bm{x}_i(t) + \Delta t \frac{p_{\theta}(\bm{x}_i \mid \bm{x}_i(t), t, \bm{x}_c) - \bm{x}_i(t)}{1 - t}
+  \end{align}
+  \State Decode candidate token IDs $ \hat{\bm{x}}_i$ for \textbf{all} $i\in\A$
+  \State $\Sset\gets$$\min(b,|\A|)$ positions in $\A$ (fixed left to right)
+  \State Commit $\bm{x}_i\gets\hat{\bm{x}}_i$ only for $i\in\Sset$
+  \State $\C\gets\C\cup\Sset$; $\A\gets\A\setminus\Sset$
+\EndWhile
+\State \Return $\bm{x}(1)$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Example ($L=12$, $b=3$).}
+Round~0 flows over positions $1{:}12$, commits $1{:}3$; round~1 flows over $4{:}12$, commits $4{:}6$; round~2 flows over $7{:}12$, commits $7{:}9$; round~3 flows over $10{:}12$, commits $10{:}12$. The predictions at positions outside the committed subset are discarded after each round. This is \emph{not} the sampler that denoises only $1{:}3$, then only $4{:}6$, etc.
+
+\section{Stage 2: GRPO for adaptive token revelation}
+\subsection{Policy state and action}
+Freeze $\theta$ initially. At reveal round $k$ the \emph{same} generator solves the flow over $\A_k$ and exposes candidate token IDs and endpoint probabilities. The policy observation $o_k$ includes:
+\begin{equation}
+o_k=(h(s),\;\C_k,\;\A_k,\;\widehat x_{\A_k},\;\text{entropy}_{\A_k},\;
+p_{\theta}(\bm{x}_{i \in \A} \mid \bm{x}_{c})).
+\end{equation}
+Policy features from generator hidden states are detached. Reference targets are used only to calculate training-time reward. The policy samples a \emph{nonempty subset} $\Sset_k\subseteq\A_k$, and its size $m_k=|\Sset_k|$ is adaptive. A convenient implementable factorization is
+\begin{align}
+ m_k&\sim p_\phi(m\mid o_k),\quad 1\le m\le |\A_{k}|,\\
+ (i_1,\ldots,i_{m_k})&\sim \prod_{r=1}^{m_k}p_\phi(i_r\mid o_k,m_k,i_{<r}),
+\qquad i_r\in\A_k\setminus\{i_1,\ldots,i_{r-1}\}.\label{eq:act}
+\end{align}
+The action is the sampled \emph{ordered sequence} $(m_k,i_1,\ldots,i_{m_k})$ whose underlying subset is committed. Its exact log probability is
+\begin{equation}
+\boxed{\log\pi_\phi(a_k\mid o_k)=\log p_\phi(m_k\mid o_k)
++\sum_{r=1}^{m_k}\log p_\phi(i_r\mid o_k,m_k,i_{<r}).}\label{eq:logp}
+\end{equation}
+No duplicate selection is possible. If the policy is defined over \emph{unordered} sets instead, an ordering aggregation is necessary; do not claim Equation~\eqref{eq:logp} is the normalized log probability of an unordered subset. For policy gradients, storing the actual sampled ordered action is valid because that is the chosen action space.
+
+\subsection{Rewards: quality, diversity, computational cost}
+Let $\tau_g$ denote one complete rollout for a German source $s$, producing English output $\widehat y_g$. Use a group of $G\ge2$ independent rollouts for the \emph{same} source. Set
+\begin{equation}
+\boxed{R_g= Q_g+\lambda_d D_g-\lambda_c C_g,}\label{eq:reward}
+\end{equation}
+\textbf{For the WMT14 task}. Set $\lambda_{d} = 0$, donot consider the diversity reward.
+\begin{itemize}
+\item \textbf{Quality $Q_g$:}
+    Measure translation accuracy using sentence-level chrF:
+    \[
+    Q_g = \frac{\mathrm{chrF}(\widehat{\bm{y}}_g,\bm{y})}{100},
+    \]
+    where $\bm{y}$ is the reference translation.
+
+    \item \textbf{Computational cost $C_g$:}
+    Penalize the number of function evaluations (NFE),
+    i.e., the number of generator forward passes:
+    \[
+    C_g = \frac{\mathrm{NFE}(\tau_g)}{N_{\mathrm{ref}}}.
+    \]
+    If each revelation round requires $T$ model evaluations,
+    then $\mathrm{NFE}(\tau_g)=K_gT$, where $K_g$ is the
+    number of revelation rounds.
+\end{itemize}
+
+
+\subsection{Group-relative policy optimization}
+For each source, obtain $G$ rollouts under a frozen old controller $\pi_{\rm old}$. For terminal rewards $R_1,\ldots,R_G$ compute
+\begin{equation}
+\widehat A_g=\frac{R_g-\bar R}{\operatorname{std}(R_1,\ldots,R_G)+\epsilon_A},\qquad
+\bar R=\frac1G\sum_{h=1}^G R_h.\label{eq:adv}
+\end{equation}
+If all rewards are identical, set the advantage to zero rather than divide by an unstable tiny value. At each stochastic reveal decision $k$, store $o_{g,k}$, ordered $a_{g,k}$, and $\log\pi_{\rm old}(a_{g,k}\mid o_{g,k})$. Define
+\begin{equation}
+ r_{g,k}(\phi)=\exp\!\left[\log\pi_\phi(a_{g,k}\mid o_{g,k})-
+ \log\pi_{\rm old}(a_{g,k}\mid o_{g,k})\right].
+\end{equation}
+A basic clipped GRPO objective \emph{to maximize} is
+\begin{equation}
+\boxed{J_{\rm GRPO}(\phi)=\E\left[
+\frac1G\sum_{g=1}^G \frac{1}{K_g}\sum_{k=0}^{K_g-1}
+\min\!\left(r_{g,k}(\phi)\widehat A_g,\,
+\operatorname{clip}(r_{g,k}(\phi),1-\varepsilon,1+\varepsilon)\widehat A_g\right)
+\right]-\beta\,\mathcal R_{\rm ref}(\phi).}\label{eq:grpo}
+\end{equation}
+$\mathcal R_{\rm ref}$ is an \emph{optional} controller-reference regularizer; leave it off initially unless implemented and verified. Forced last-round actions must be deterministic and excluded from the stochastic policy loss. This objective updates only $\phi$; the generator $\theta$ stays frozen for the initial Stage~2 experiment. Using a common terminal advantage for every decision is a simple episodic baseline, not a claim of optimal credit assignment.
+
+\begin{algorithm}[htbp]
+\caption{Stage 2: Train the policy $\pi_{\phi}$}\label{alg:rl}
+\begin{algorithmic}[1]
+\Require frozen generator $p_{\theta}$, controller $\pi_\phi$, $G$ rollouts
+\For{$g=1,\ldots,G$}
+  \State Initialize empty context $\C$, all remaining positions $\A$
+  \While{$\A\ne\varnothing$}
+    \State Sample $\bm{x}_{i}(0) \sim \mathcal{N}(0, I_d)$ for \textbf{all} $i \in \A$
+    \State Infer $\bm{x}_i(1)$ for \textbf{all} $i \in \A$
+    \State Draw  $\bm{m}_{i\in \A}\sim\pi_\phi(\cdot\mid \bm{s})$; extract $\Sset$
+    \State Commit only $\bm{x}_{\Sset}$; update $\C,\A$ and source cache
+  \EndWhile
+  \State Compute the reward $\bm{r}_{g}$
+\EndFor
+\State Compute group-relative advantages using Eq.~\eqref{eq:adv}
+\State Update only $\phi$ by maximizing Eq.~\eqref{eq:grpo}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Attention, caching, and training--inference consistency}\label{sec:cache}
+\subsection{Proposed attention contract}
+The architecture must support \emph{active-to-active} interaction while keeping permanent context invariant. A sufficient uncached attention design is:
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}p{0.26\linewidth}XXX@{}}\toprule
+Query $\downarrow$, keys $\rightarrow$ & Source keys & Committed target keys & Active target keys \\ \midrule
+Source queries & Allow & Disallow & Disallow \\
+Committed queries & Allow & Allow only same/earlier reveal group & Disallow \\
+Active queries & Allow & Allow all committed & Allow all active \\ \bottomrule
+\end{tabularx}
+\end{center}
+For clean committed positions, causal structure is defined by \emph{revelation group}, not necessarily by absolute token index. In the first baseline, a full uncached forward pass is the ground truth implementation. Source/committed representations must be independent of the current flow time $t$; otherwise cached KV values become stale when $t$ changes. Time conditioning can be applied on an active-only branch (or another proved-equivalent mechanism).
+
+\subsection{Safe incremental KV-cache construction}
+\begin{enumerate}
+\item Precompute clean source KV states using source-only attention.
+\item Run each flow evaluation on all active positions with access to source and committed KV, and full active-to-active attention. \emph{Never} append changing noisy active states to permanent cache.
+\item After choosing $\Sset_k$, convert its final candidates to hard token IDs; then perform a \emph{separate clean-context forward} for the newly committed group using no active-token keys. Append its invariant per-layer KV states.
+\item Maintain absolute target positions and reveal-group metadata; do not assume that cache append order equals left-to-right target order.
+\item Compare cached and fully recomputed logits/endpoint distributions under exactly the same sampled noise, target set, masks, times, and token IDs. Enable cache only after numerical parity tests pass.
+\end{enumerate}
+An implementation that allows a committed state to attend current noisy tokens, or injects changing flow-time embeddings globally into committed states, cannot safely reuse that cached state. Caching is therefore an architectural correctness constraint, not a claim that toggling \texttt{use\_cache=True} is sufficient.
+
+\section{WMT14 setup and variable-length outputs}\label{sec:length}
+Use the WMT14 German-to-English train/validation/test splits supported by the chosen dataset pipeline; fix the same tokenizer and scoring conventions across all baselines. Append target EOS during training. Keep source clean and visible; noise and VFM losses apply only to target $\A$. Report the exact split identity, preprocessing, and detokenization used.
+
+\paragraph{Target length must be generated, not read from the reference.}
+A first implementable approach is a \emph{source-only} length estimator or bucket predictor that proposes $L_{\rm canvas}$; alternatively choose a documented fixed maximum canvas and let a committed EOS terminate output when all earlier positions are committed. Compare these alternatives, record failed EOS and truncation. At arbitrary-order reveal, an EOS candidate at position $j$ cannot finish generation while any position $i<j$ remains uncommitted. Positions after the first valid committed EOS are ignored for decoding. The reference translation length, EOS index, and future target IDs must never enter inference or policy observations.
+
+\paragraph{Important fairness note.}
+Some legacy translation implementations use reference lengths at evaluation time; this would invalidate our claim of a practical generator. Log whether any baseline uses a supplied target length and do not compare wall-clock generation quality under unequal length information.
+
+\section{Compute cost, memory, and experimental controls}
+For a target canvas of length $L$ and fixed commitment size $b$, Stage~1 takes $K\approx\lceil L/b\rceil$ full-remaining flow solves. With $T$ network evaluations per solve, the approximate total denoiser count is $KT$; cache-context update calls and guidance may add evaluations. Stage~2 learns $K$ adaptively, while $T$ is initially fixed. The flow solves shrink in active length as positions commit, so NFE alone does not determine FLOPs or latency. Report all three.
+
+Each continuous Gaussian active state is nominally $V$-dimensional. For batch size $B$, active length $M$, and float dtype bytes $q$, one dense $B\times M\times V$ buffer uses $qBMV$ bytes; multiple buffers, temporary projections, and logits can multiply peak memory. A robust design projects continuous active inputs to transformer width $d$, retains normal clean-token embedding lookup, and avoids materializing redundant $B\times M\times V$ arrays when possible. \emph{Do not} replace the specified Gaussian vocabulary-space prior with a low-dimensional Gaussian without documenting a distinct alternative model and loss.
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}llX@{}}\toprule
+ID & Method & Scientific question \\ \midrule
+E0 & Full remaining, one solve & What is the no-revelation baseline at matched flow NFEs? \\
+E1 & Stage 1 fixed $b\in\{4,8,16,32\}$ LTR & Quality/latency versus commitment size. \\
+E2 & Stage 1 mixed fixed-size order & Does random-order context augmentation help Stage 2? \\
+E3 & Random nonempty subset (budget matched) & Does any adaptation outperform an untrained selector? \\
+E4 & Confidence/entropy-based selector & Is an RL controller better than a simple heuristic? \\
+E5 & GRPO quality+cost & Main result, reward diversity disabled. \\
+E6 & GRPO quality+cost+diversity & Optional reward ablation after E5 is stable. \\ \bottomrule
+\end{tabularx}
+\end{center}
+Measure corpus BLEU and chrF, median/p95 translation latency, wall-clock throughput, number of reveal rounds, total generator NFEs, clean-cache rebuild calls, EOS failure rate, memory, and variation across seeds. Compare quality at \emph{matched NFE and matched latency budgets}; a controller that reduces $K$ but degrades translation quality may not improve the Pareto frontier.
+
+\section{Implementation modules and execution milestones}
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}p{0.39\linewidth}X@{}}\toprule
+Proposed module (new, not a claim about repo APIs) & Contract \\ \midrule
+\texttt{blockflow/data/translation.py} & WMT14 source-target tokenization, EOS, length, split. \\
+\texttt{model/continuous.py} & Gaussian/continuous $V$-dimensional state projection and time embedding. \\
+\texttt{blockflow/model/attention.py} & Source, reveal-group-committed, active set-causal masks. \\
+\texttt{blockflow/flow/vfm.py} & Gaussian path, endpoint categorical CE, instantaneous velocity. \\
+\texttt{blockflow/flow/sample.py} & Solve for \emph{all remaining} positions; return IDs, probabilities, NFE. \\
+\texttt{blockflow/generate/fixed.py} & Fixed $b$ commit after complete all-remaining flow solve. \\
+\texttt{blockflow/generate/cache.py} & Clean-token KV rebuild/append, uncached parity harness. \\
+\texttt{blockflow/rl/policy.py} & Cardinality + ordered distinct-index sampling, valid log probability. \\
+\texttt{blockflow/rl/grpo.py} & Group rollouts, task reward, clipped policy loss, frozen generator. \\
+\texttt{blockflow/eval/translation.py} & chrF/BLEU, NFE, latency, EOS, output generation audits. \\ \bottomrule
+\end{tabularx}
+\end{center}
+\textbf{M0 (inspect and preserve):} checkout both referenced repositories; record commit hashes, inspect true attention/cache model signatures, understand Semicat's VFM-only code path, and run a tiny baseline. Do not blindly merge their frameworks.\par
+\textbf{M1 (VFM from scratch):} get source-conditioned Gaussian-to-categorical VFM training on a very small WMT14 subset. Verify finite loss and proper output simplex. No RL.\par
+\textbf{M2 (fixed reveal, no cache):} implement all-remaining flow sampling, commit fixed $b$, ensure EOS correctness, prevent reference leakage. Establish nontrivial translation outputs.\par
+\textbf{M3 (cache and heuristics):} add clean-context cache with cached/uncached parity, then random and confidence revelation baselines.\par
+\textbf{M4 (GRPO):} freeze VFM generator, implement ordered subset policy, group rollouts, clipped GRPO, quality and cost reward; ablate diversity only afterward.\par
+\textbf{M5 (full WMT14):} run controlled benchmarks and save configs, seeds, checkpoints, CPU/GPU/hardware characteristics, and evaluation artifacts.
+
+\section{Mandatory correctness tests and failure modes}
+\begin{enumerate}
+\item \textbf{Noise path:} $z_0\sim\N(0,I_V)$, and $z_1=e(y)$ for every valid target position; no masked corruption, discrete-uniform vocabulary prior, or quiet change of model family.
+\item \textbf{All-remaining objective:} nonzero supervised loss on all $i\in\A$, including those outside the next fixed $b$ commitment set; zero loss on committed/source/pad positions.
+\item \textbf{Reference leakage:} replacing target IDs at unrevealed positions without changing their explicit interpolated noisy inputs cannot alter encoded clean source/committed context; no unobserved targets in policy observations.
+\item \textbf{Noisy-state isolation:} clean context is independent of Gaussian seed and flow time, enabling safe cache reuse; full attention rule tested for noncontiguous selections.
+\item \textbf{Commit immutability:} previously committed IDs never change, even when later flow solves predict different candidates elsewhere.
+\item \textbf{Sampler validity:} predicted endpoints sum to one and remain nonnegative; final categorical sampling valid; fixed random seeds reproduce uncached generations.
+\item \textbf{Fixed-$b$ semantics:} stage 1 always commits exactly $\min(b,|\A|)$ when no valid EOS shortcut applies; model still samples every remaining position at every round.
+\item \textbf{KV parity:} cached/uncached outputs numerically agree at each time step for an identical fully specified generation trajectory and positional IDs.
+\item \textbf{Policy log probability:} sampled ordered actions are nonempty, contain no duplicate/committed indices, and have correct normalized probability on tiny enumerable examples.
+\item \textbf{GRPO:} gradient affects controller $\phi$ only; frozen $\theta$ stays unchanged; zero-variance groups and forced final actions handled correctly.
+\item \textbf{EOS and length:} no reference-based target length at test time; termination well-defined for noncontiguous commitment.
+\item \textbf{Compute accounting:} actual generator evaluations, context rebuilds and elapsed time measured rather than estimated or silently omitted.
+\end{enumerate}
+
+\section{Instructions for an implementation agent}
+The source-of-truth contract is Sections~1, 4, 5, and~6. Begin by producing a short code-level map of \texttt{setdlms} and \texttt{semicat} showing exactly which functions can be reused. \emph{Inspect code and signatures before patching.} If a useful API is absent, say so and introduce a tested adapter rather than inventing its existence. Implement M0--M2 and execute smoke tests before any RL changes. Keep the original baseline runnable. Flag scientific decisions (choice of target canvas, joint versus per-token noise, absolute positions, fixed context mixture, duration $T$, and reward weights) explicitly in configuration and logs. Do not fabricate experiment metrics.
+
+\section{Research claims and limitations}
+The intended contribution is the \emph{generation/commitment decoupling} and a \emph{learned token-revelation policy} optimizing translation quality against inference cost. We do not claim an exact autoregressive likelihood interpolation, or that VFM automatically gives good one-step translation. Training on clean teacher-forced contexts can differ from inference on committed model predictions; arbitrary-order contexts and group-based reward diversity add further mismatch. All proposed benefits require controlled experiments. The named repositories are architectural/algorithmic references, not evidence that this new end-to-end system is already implemented.
+
+\clearpage
+\begin{thebibliography}{9}
+\bibitem{roos2026} D. Roos et al., ``Categorical Flow Maps,'' \emph{International Conference on Machine Learning}, 2026. \url{https://proceedings.mlr.press/v306/roos26a.html}. Official text implementation: \url{https://github.com/olsdavis/semicat}.
+\bibitem{arriola2026} M. Arriola and V. Kuleshov, ``Set Diffusion: Interpolating Token Orderings between Autoregression and Diffusion for Fast and Flexible Decoding,'' \emph{International Conference on Machine Learning}, 2026. \url{https://proceedings.mlr.press/v306/arriola26a.html}. Code: \url{https://github.com/kuleshov-group/setdlms}.
+\bibitem{eijkelboom2024} F. Eijkelboom et al., ``Variational Flow Matching for Graph Generation,'' \emph{NeurIPS}, 2024.
+\bibitem{gat2024} I. Gat et al., ``Discrete Flow Matching,'' \emph{NeurIPS}, 2024. (Different discrete-state formulation; contextual reference only.)
+\bibitem{deepseekmath2024} Z. Shao et al., ``DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models,'' 2024. (Source of GRPO-style group-relative optimization.)
+\end{thebibliography}
+\end{document}

@@ -1,5 +1,7 @@
 from functools import partial
+from typing import Any, Dict
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from flax import jax_utils
@@ -10,6 +12,9 @@ from utils.logging_utils import log_for_0
 from utils.sampling_utils import (
     restore_cond, _ode_step, _sde_step, get_sampling_steps,
 )
+from utils.encoder_utils import encode_text
+from utils.block_utils import build_committed_context
+from utils.data_utils import get_pad_token_id
 from modules.t5_encoder import get_encoder
 
 PRNGKey = jax.random.PRNGKey
@@ -205,6 +210,131 @@ def _shard_noise(device_rngs, num_local_devices, per_device, max_length, d_model
         jax.random.normal(device_rngs[i], (per_device, max_length, d_model)) * noise_scale
         for i in range(num_local_devices)
     ])
+
+
+# ============================================
+# Block-to-block (fixed-commitment) inference — Adaptive BlockFlow Stage 1, Alg. 2
+# ============================================
+def generate_block_cond(
+    state: Any,
+    encoder_params: Dict,
+    encoder_apply_fn,
+    tokenizer,
+    config: Config,
+    sampling_config: SamplingConfig,
+    source_ids: Array,
+    source_lengths: Array,
+    rng: PRNGKey,
+    use_ema: bool = True,
+):
+    """Block-to-block conditional generation (single device, eager Python loop).
+
+    Each round re-encodes the growing committed context
+    (source + already-committed target) through the frozen T5 encoder and feeds it in
+    as the sampler's "clean" cond_seq/cond_seq_mask — the same restore-clean-positions
+    mechanism `_generate_samples_single_batch` already uses for the source prefix,
+    just extended to cover committed target tokens too. A full, uncached flow solve
+    runs every round (the documented M1/M2 baseline; no KV-cache reuse — see
+    docs/main.tex Sec. 6). Not pmapped: this is a smoke-test / qualitative-eval
+    utility, not a production multi-device eval path.
+
+    Args:
+        source_ids: (B, config.max_input_length) int array, right-padded with the
+            pad token id (as produced by the existing dataloader's collate_fn).
+        source_lengths: (B,) int array, number of real (non-pad) source tokens.
+
+    Returns:
+        List of B decoded strings (special tokens stripped).
+    """
+    pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
+    eos_token_id = tokenizer.eos_token_id
+    block_size = config.block_size
+    max_input_length = config.max_input_length
+    max_length = config.max_length
+    canvas_length = max_length - max_input_length
+
+    model_params = state.ema_params1 if use_ema else state.params
+    model_apply_fn = state.apply_fn
+    cfg_scale = sampling_config.cfgs[0]
+    self_cond_cfg_scale = sampling_config.self_cond_cfg_scales[0]
+
+    batch_size = source_ids.shape[0]
+    pos_full = jnp.arange(max_length)[None, :]
+    pos_tgt = jnp.arange(canvas_length)[None, :]
+    is_source_full = pos_full < source_lengths[:, None]
+
+    committed_target_ids = jnp.full((batch_size, canvas_length), pad_token_id, dtype=jnp.int32)
+    committed_len = jnp.zeros((batch_size,), dtype=jnp.int32)
+    finished = jnp.zeros((batch_size,), dtype=bool)
+
+    max_rounds = (canvas_length + block_size - 1) // block_size
+    for _ in range(max_rounds):
+        if bool(jnp.all(finished | (committed_len >= canvas_length))):
+            break
+
+        full_ids = jnp.concatenate([source_ids, committed_target_ids], axis=1)
+        is_committed_full = (pos_full >= max_input_length) & (
+            pos_full < (max_input_length + committed_len)[:, None]
+        )
+        is_valid_full = is_source_full | is_committed_full
+        encoder_attn, _, clean_mask = build_committed_context(
+            is_source_full, is_committed_full, is_valid_full,
+        )
+
+        rng, enc_rng, noise_rng, t_rng = jax.random.split(rng, 4)
+        cond_seq = encode_text(
+            input_ids=full_ids, attention_mask=encoder_attn,
+            encoder_apply_fn=encoder_apply_fn, encoder_params=encoder_params,
+            latent_mean=config.latent_mean, latent_std=config.latent_std,
+        )
+        d_model = cond_seq.shape[-1]
+        z0 = jax.random.normal(noise_rng, (batch_size, max_length, d_model)) * config.denoiser_noise_scale
+
+        t_steps = get_sampling_steps(
+            t_rng, n_steps=sampling_config.num_sampling_steps[0],
+            time_schedule=sampling_config.time_schedule,
+            P_mean=config.denoiser_p_mean, P_std=config.denoiser_p_std,
+        )
+        z_final = _generate_samples_single_batch(
+            model_params=model_params, model_apply_fn=model_apply_fn, rng=rng,
+            z=z0, t_steps=t_steps, cond_seq=cond_seq, cond_seq_mask=clean_mask,
+            config=config, sampling_config=sampling_config,
+            cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
+        )
+        predicted_ids = _dlm_decode_batch(
+            z=z_final, model_params=model_params, model_apply_fn=model_apply_fn,
+            t_final_val=t_steps[-1], config=config, self_cond_cfg_scale=self_cond_cfg_scale,
+        )
+        predicted_target_ids = predicted_ids[:, max_input_length:]
+
+        # Commit the next `block_size` tokens of the active region (left-to-right).
+        commit_upto = jnp.minimum(committed_len + block_size, canvas_length)
+        newly_committed = (pos_tgt >= committed_len[:, None]) & (pos_tgt < commit_upto[:, None])
+        committed_target_ids = jnp.where(newly_committed, predicted_target_ids, committed_target_ids)
+
+        # EOS can only end generation at its own position once everything before it is
+        # committed (Sec. 5); since we always commit left-to-right contiguously, the
+        # first EOS among the committed-so-far tokens is exactly that position. Restrict
+        # the check to positions actually committed by this round (`pos_tgt < commit_upto`)
+        # — with pad_token: eos, pad_token_id == eos_token_id, so the not-yet-committed
+        # filler tail would otherwise spuriously register as an EOS hit.
+        is_eos = (committed_target_ids == eos_token_id) & (pos_tgt < commit_upto[:, None])
+        has_eos = jnp.any(is_eos, axis=1)
+        first_eos_pos = jnp.argmax(is_eos, axis=1)
+        committed_len = jnp.where(finished, committed_len, commit_upto)
+        committed_len = jnp.where((~finished) & has_eos, first_eos_pos + 1, committed_len)
+        finished = finished | has_eos
+        committed_target_ids = jnp.where(
+            pos_tgt < committed_len[:, None], committed_target_ids, pad_token_id,
+        )
+
+    texts = []
+    committed_len_np = np.array(committed_len)
+    committed_target_ids_np = np.array(committed_target_ids)
+    for i in range(batch_size):
+        ids = committed_target_ids_np[i, :committed_len_np[i]]
+        texts.append(tokenizer.decode(ids, skip_special_tokens=True))
+    return texts
 
 
 def _setup_generation(state, config, batch_size, header):

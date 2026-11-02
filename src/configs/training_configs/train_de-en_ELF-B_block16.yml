@@ -1,0 +1,82 @@
+# Phase 1: block-to-block (fixed-commitment) revelation, WMT14 De-En, commit size b=16.
+# Same task/encoder/architecture as train_de-en_ELF-B.yml; only the denoiser training
+# objective changes (teacher-forced committed prefix + active-only noise/loss — see
+# utils/block_utils.py and train_step.py). Batch/epoch settings are scaled down for a
+# 2x A40 (46GB) sanity run rather than the paper's TPU v5p-64 setup.
+
+# Dataset
+data_path: "embedded-language-flows/wmt14_de-en_train_t5"
+eval_data_path: "embedded-language-flows/wmt14_de-en_validation_t5"
+max_length: 128
+max_input_length: 64
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
+use_block_revelation: true
+block_size: 16
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 1.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+label_drop_prob: 0.1
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — scaled for 2x A40, ~27GB/GPU target
+epochs: 20
+global_batch_size: 64
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 500
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/cond_sampling_configs.yml"
+num_samples: 64
+
+# Logging & Checkpointing
+# save_freq is a fraction-of-epoch; steps_per_epoch = 4508785 // 64 = 70449, so
+# 2000 / 70449 ≈ 0.0283876 saves a checkpoint roughly every 2000 steps.
+log_freq: 10
+save_freq: 0.0283876
+eval_freq: 5
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-wmt-de-en-block16
+
+# Misc
+seed: 42

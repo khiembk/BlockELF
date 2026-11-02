@@ -60,6 +60,13 @@ class Config:
     t_eps: float = 5e-2
     time_schedule: str = "logit_normal"  # 'logit_normal' or 'uniform'
 
+    # Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1.
+    # When enabled, each training step teacher-forces a committed target prefix of
+    # size k*block_size (k sampled per-example) and restricts noise/loss to the
+    # remaining ("active") target positions. See utils/block_utils.py.
+    use_block_revelation: bool = False
+    block_size: int = 16  # Fixed commit size b
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch
