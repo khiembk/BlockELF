@@ -9,20 +9,28 @@ Covers:
   2. End-to-end `train_step` smoke test with a tiny ELF model + dummy encoder,
      both in block-revelation mode and in the original (non-block) mode, to confirm
      finite/sane losses and that no pad/committed position leaks into the loss.
+  3. `compute_block_round_counts` + the per-example K_i-weighted resampling it enables:
+     confirms P(K_i=j | round=0 sampled) matches the true marginal P(K_i=j) under the
+     weighted scheme, where the naive uniform-per-example scheme is biased toward short
+     examples (see train.py's `sample_weights` wiring and data_utils.py docstring).
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import collections
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from datasets import Dataset
 from flax import jax_utils
 from flax.training.common_utils import shard
 
 from utils.block_utils import sample_block_round
+from utils.data_utils import compute_block_round_counts
 from utils.encoder_utils import build_self_attn_cond_masks
 from utils.train_utils import TrainState, create_learning_rate_fn
 from modules.model import ELF
@@ -195,7 +203,48 @@ def test_train_step_block_mode_finite_loss():
     print(f"[OK] mean active_frac block={np.mean(block_fracs):.3f} vs non-block={np.mean(base_fracs):.3f}")
 
 
+def test_round_count_reweighting_fixes_bias():
+    rng = np.random.default_rng(0)
+    n = 20000
+    block_size = 16
+    max_input_length = 64
+    max_length = 128
+    cond_lens = rng.integers(1, max_input_length, size=n)
+    target_lens = rng.integers(1, 100, size=n)
+    ds = Dataset.from_dict({
+        "condition_sequence_length": cond_lens.tolist(),
+        "sequence_length": target_lens.tolist(),
+    })
+
+    K = compute_block_round_counts(ds, block_size, max_length, max_input_length)
+    hist = collections.Counter(K.tolist())
+    true_marginal = {k: v / n for k, v in hist.items()}
+
+    # Old (biased) scheme: round=0 instance mass per K_i bucket is P(K_i=j) * (1/j).
+    old_mass = {j: true_marginal[j] * (1.0 / j) for j in true_marginal}
+    old_total = sum(old_mass.values())
+    old_posterior = {j: old_mass[j] / old_total for j in old_mass}
+
+    # New scheme: examples drawn with weight K_i, so P(example, round=0) = 1/sum(K_i)
+    # for every example regardless of K_i -> P(K_i=j | round=0) should equal true marginal.
+    sum_K = K.sum()
+    new_mass = {j: hist[j] * (1.0 / sum_K) for j in hist}
+    new_total = sum(new_mass.values())
+    new_posterior = {j: new_mass[j] / new_total for j in new_mass}
+
+    assert old_posterior[1] > true_marginal[1] * 1.5, "expected old scheme to over-represent K_i=1"
+    for j in true_marginal:
+        assert abs(new_posterior[j] - true_marginal[j]) < 1e-9, (
+            f"K_i={j}: weighted posterior {new_posterior[j]} != true marginal {true_marginal[j]}"
+        )
+    print(
+        f"[OK] K_i=1: true={true_marginal[1]:.3f}, old_biased_posterior={old_posterior[1]:.3f} "
+        f"(inflated), new_weighted_posterior={new_posterior[1]:.3f} (matches true)"
+    )
+
+
 if __name__ == "__main__":
     test_sample_block_round_invariants()
     test_train_step_block_mode_finite_loss()
+    test_round_count_reweighting_fixes_bias()
     print("\nAll block-flow sanity tests passed.")

@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from datasets import DatasetDict, load_dataset as hf_load_dataset, load_from_disk
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.encoder_utils import build_self_attn_cond_masks
@@ -51,6 +51,29 @@ def pad_and_truncate(ids_list, target_len, pad_token_id):
     return np.stack(padded), np.array(lengths)
 
 
+def compute_block_round_counts(dataset, block_size: int, max_seq_length: int, max_input_seq_length: Optional[int]):
+    """Per-example number of block-revelation rounds K_i = ceil(effective_target_len / block_size).
+
+    Mirrors the effective-length truncation `get_dataloader`'s collate_fn applies (condition
+    truncated to `max_input_seq_length`, then the full concatenation truncated to
+    `max_seq_length`), using the dataset's precomputed length columns directly — no
+    re-tokenization needed. Used to correct the round-sampling bias described in
+    `sample_block_round` (utils/block_utils.py): sampling round k ~ Uniform(0, K_i) per
+    example over-represents round 0 (and other low-k rounds) from short examples relative
+    to their true share of the corpus, since P(k=0 | example) = 1/K_i is largest for small
+    K_i. Oversampling examples in proportion to K_i here exactly cancels that bias — each
+    (example, round) pair ends up drawn with equal global probability, so conditioning on
+    "round 0 was sampled" no longer skews the K_i mixture (see train_step.py).
+    """
+    cond_lens = np.array(dataset["condition_sequence_length"]) if "condition_sequence_length" in dataset.column_names else np.zeros(len(dataset), dtype=np.int64)
+    target_lens = np.array(dataset["sequence_length"])
+    if max_input_seq_length is not None:
+        cond_lens = np.minimum(cond_lens, max_input_seq_length)
+    total_lens = np.minimum(cond_lens + target_lens, max_seq_length)
+    effective_target_lens = np.maximum(total_lens - cond_lens, 1)
+    return np.ceil(effective_target_lens / block_size).astype(np.int64)
+
+
 def get_dataloader(
     dataset,
     batch_size: int,
@@ -61,8 +84,15 @@ def get_dataloader(
     pad_token_id: int = 0,
     max_input_seq_length: Optional[int] = None,
     distributed: bool = True,
+    sample_weights: Optional[np.ndarray] = None,
 ):
-    """Create a DataLoader."""
+    """Create a DataLoader.
+
+    `sample_weights`, if given, draws examples with replacement proportional to these
+    weights instead of the standard uniform (distributed) shuffle — see
+    `compute_block_round_counts`. Single-host only (no distributed-aware weighted
+    sampling); not needed for the single-host runs this is currently used in.
+    """
 
     def collate_fn(batch_list):
         input_ids_list = [np.array(item["input_ids"]) for item in batch_list]
@@ -99,6 +129,16 @@ def get_dataloader(
         batch_size=batch_size, num_workers=num_workers, collate_fn=collate_fn,
         drop_last=drop_last, persistent_workers=num_workers > 0,
     )
+    if sample_weights is not None:
+        if distributed and jax.process_count() > 1:
+            raise NotImplementedError(
+                "sample_weights (block-round reweighting) is single-host only; "
+                "got jax.process_count() > 1."
+            )
+        sampler = WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(dataset), replacement=True,
+        )
+        return DataLoader(dataset, sampler=sampler, **common)
     if distributed:
         sampler = DistributedSampler(
             dataset, num_replicas=jax.process_count(), rank=jax.process_index(),

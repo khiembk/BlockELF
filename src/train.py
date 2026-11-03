@@ -42,7 +42,7 @@ from utils.train_utils import (
 from generation import run_generation
 from configs.config import load_config_from_yaml, apply_config_overrides, load_sampling_configs, SamplingConfig
 from modules.model import ELF_models
-from utils.data_utils import get_dataloader, prepare_batch, load_dataset, get_pad_token_id
+from utils.data_utils import get_dataloader, prepare_batch, load_dataset, get_pad_token_id, compute_block_round_counts
 from train_step import train_step
 
 
@@ -265,11 +265,28 @@ def run_training(config):
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
     log_for_0(f"Config saved to {config_path}")
 
+    # Block-revelation training samples one random round k~Uniform(0,K_i) per example
+    # (utils.block_utils.sample_block_round), which over-represents round 0 from short
+    # examples (small K_i) when examples are otherwise drawn uniformly. Oversampling
+    # examples proportional to K_i here exactly cancels that bias (see
+    # compute_block_round_counts's docstring).
+    sample_weights = None
+    if config.use_block_revelation:
+        round_counts = compute_block_round_counts(
+            train_dataset, config.block_size, config.max_length, config.max_input_length,
+        )
+        sample_weights = round_counts.astype(np.float64)
+        log_for_0(
+            f"Block-round reweighting enabled: mean K_i={round_counts.mean():.2f}, "
+            f"max K_i={round_counts.max()}"
+        )
+
     train_dataloader = get_dataloader(
         train_dataset, batch_size=local_batch_size, shuffle=True,
         num_workers=config.num_workers, drop_last=True,
         max_seq_length=config.max_length, pad_token_id=pad_token_id,
         max_input_seq_length=config.max_input_length,
+        sample_weights=sample_weights,
     )
 
     # ============================================
@@ -320,7 +337,8 @@ def run_training(config):
             train_metrics = []
             jax.clear_caches()
 
-        train_dataloader.sampler.set_epoch(epoch)
+        if hasattr(train_dataloader.sampler, "set_epoch"):
+            train_dataloader.sampler.set_epoch(epoch)
         train_iterator = iter(train_dataloader)
         train_loader = prefetch_to_device(train_iterator, size=4)
 
