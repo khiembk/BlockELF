@@ -152,7 +152,7 @@ The evaluator runs on each task's **validation** set and reports BLEU for WMT14 
 
 ## Data Preparation
 
-Three task settings: unconditional generation on **OpenWebText**, machine translation on **WMT14 De-En**, and summarization on **XSum**. All use a frozen T5 encoder for text-to-embedding mapping.
+Four task settings: unconditional generation on **OpenWebText** and **LM1B**, machine translation on **WMT14 De-En**, and summarization on **XSum**. All use a frozen T5 encoder for text-to-embedding mapping.
 
 #### Pre-tokenized splits
 
@@ -166,6 +166,17 @@ We provide pre-tokenized splits (T5 tokenizer) and the JAX T5-small encoder on H
 | T5 encoder | `embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl` |
 
 To use a local copy, point `data_path` at a directory saved with `datasets.save_to_disk` — the loader falls back to `load_from_disk`.
+
+#### LM1B
+
+LM1B (One Billion Word Benchmark) isn't pre-tokenized on HF yet; tokenize it yourself with `src/scripts/prepare_lm1b.py`, which loads [`dvruette/lm1b`](https://huggingface.co/datasets/dvruette/lm1b) (falls back to `billion-word-benchmark/lm1b`/legacy `lm1b`), T5-tokenizes each sentence with an appended EOS, and saves `train`/`test` splits (unlike OpenWebText's packed long documents, LM1B sentences are already short — each sentence is one example, no packing):
+
+```bash
+cd src
+python scripts/prepare_lm1b.py --output_dir /path/to/lm1b_t5 --max_length 128
+```
+
+Then point `train_lm1b_ELF-B.yml` / `train_lm1b_ELF-B_block16.yml`'s `data_path` at `/path/to/lm1b_t5/train`.
 
 #### Prepare your own data
 
@@ -221,7 +232,10 @@ Available training configs:
 - `configs/training_configs/train_owt_ELF-M.yml` — unconditional generation on OpenWebText, ELF-M
 - `configs/training_configs/train_owt_ELF-L.yml` — unconditional generation on OpenWebText, ELF-L
 - `configs/training_configs/train_de-en_ELF-B.yml` — WMT14 De-En machine translation
+- `configs/training_configs/train_de-en_ELF-B_block16.yml` — WMT14 De-En with block-to-block (fixed-commitment) revelation, Adaptive BlockFlow Stage 1
 - `configs/training_configs/train_xsum_ELF-B.yml` — XSum abstractive summarization
+- `configs/training_configs/train_lm1b_ELF-B.yml` — LM1B (One Billion Word Benchmark) unconditional generation
+- `configs/training_configs/train_lm1b_ELF-B_block16.yml` — LM1B with block-to-block (fixed-commitment) revelation, Adaptive BlockFlow Stage 1
 
 Default ELF-B training uses Muon at blr=0.001 (base learning rate; effective lr = blr × batch_size / 256 = 0.002 at the default batch size of 512), global batch size 512, and runs 5 epochs on OWT (~95K steps) on TPU v5p-64 (~1.5 h per epoch).
 

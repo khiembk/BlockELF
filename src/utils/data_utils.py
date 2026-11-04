@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from datasets import DatasetDict, load_dataset as hf_load_dataset, load_from_disk
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.encoder_utils import build_self_attn_cond_masks
@@ -51,6 +51,16 @@ def pad_and_truncate(ids_list, target_len, pad_token_id):
     return np.stack(padded), np.array(lengths)
 
 
+def _column_to_numpy(dataset, column: str) -> np.ndarray:
+    """Vectorized column extraction via the underlying Arrow table.
+
+    `np.array(dataset[column])` goes through `datasets`' row-by-row Python iterator,
+    which is unusably slow on large datasets (e.g. ~2 minutes on LM1B's 30.3M rows,
+    vs. <1s here) — confirmed with py-spy (stuck in formatting.py's `extract_row`).
+    """
+    return dataset.data.column(column).to_numpy(zero_copy_only=False)
+
+
 def compute_block_round_counts(dataset, block_size: int, max_seq_length: int, max_input_seq_length: Optional[int]):
     """Per-example number of block-revelation rounds K_i = ceil(effective_target_len / block_size).
 
@@ -65,13 +75,41 @@ def compute_block_round_counts(dataset, block_size: int, max_seq_length: int, ma
     (example, round) pair ends up drawn with equal global probability, so conditioning on
     "round 0 was sampled" no longer skews the K_i mixture (see train_step.py).
     """
-    cond_lens = np.array(dataset["condition_sequence_length"]) if "condition_sequence_length" in dataset.column_names else np.zeros(len(dataset), dtype=np.int64)
-    target_lens = np.array(dataset["sequence_length"])
+    cond_lens = (
+        _column_to_numpy(dataset, "condition_sequence_length")
+        if "condition_sequence_length" in dataset.column_names
+        else np.zeros(len(dataset), dtype=np.int64)
+    )
+    target_lens = _column_to_numpy(dataset, "sequence_length")
     if max_input_seq_length is not None:
         cond_lens = np.minimum(cond_lens, max_input_seq_length)
     total_lens = np.minimum(cond_lens + target_lens, max_seq_length)
     effective_target_lens = np.maximum(total_lens - cond_lens, 1)
     return np.ceil(effective_target_lens / block_size).astype(np.int64)
+
+
+class _ReplacementWeightedSampler(Sampler):
+    """numpy.random.choice-based weighted-with-replacement sampler.
+
+    Replaces `torch.utils.data.WeightedRandomSampler`, whose underlying
+    `torch.multinomial` hard-caps the number of categories at 2^24 (16,777,216) — fine
+    for WMT14 (4.5M rows) but LM1B's 30.3M rows exceeds it, raising
+    "RuntimeError: number of categories cannot exceed 2^24". `numpy.random.choice` has
+    no such limit.
+    """
+
+    def __init__(self, weights: np.ndarray, num_samples: int):
+        weights = np.asarray(weights, dtype=np.float64)
+        self._probs = weights / weights.sum()
+        self._num_samples = num_samples
+
+    def __iter__(self):
+        rng = np.random.default_rng()
+        indices = rng.choice(len(self._probs), size=self._num_samples, replace=True, p=self._probs)
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self._num_samples
 
 
 def get_dataloader(
@@ -135,9 +173,7 @@ def get_dataloader(
                 "sample_weights (block-round reweighting) is single-host only; "
                 "got jax.process_count() > 1."
             )
-        sampler = WeightedRandomSampler(
-            weights=sample_weights, num_samples=len(dataset), replacement=True,
-        )
+        sampler = _ReplacementWeightedSampler(weights=sample_weights, num_samples=len(dataset))
         return DataLoader(dataset, sampler=sampler, **common)
     if distributed:
         sampler = DistributedSampler(

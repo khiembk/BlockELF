@@ -1,0 +1,79 @@
+# LM1B (One Billion Word Benchmark), unconditional, no block revelation. Ablation
+# baseline for train_lm1b_ELF-B_block16.yml: identical data/model/compute budget, only
+# `use_block_revelation` differs, so the two are directly comparable (unlike this repo's
+# WMT14 pair, where the non-block config targets the original TPU-scale run instead of
+# the GPU sanity-run scale). See train_lm1b_ELF-B_block16.yml for the full rationale.
+
+# Dataset
+data_path: "/scratch/khiem.tran@ad.wsu.edu/datasets/lm1b_t5/train"
+max_length: 128
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# No block revelation (default use_block_revelation: false) — plain full-canvas
+# denoiser training, same as train_owt_ELF-B.yml but on LM1B.
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 5.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — matches train_lm1b_ELF-B_block16.yml's compute
+# budget for a fair ablation (see that file for the steps_per_epoch / OOM-driven
+# batch+grad_accum derivation).
+epochs: 1
+global_batch_size: 64
+grad_accum_steps: 2
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 4000
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 200
+
+# Logging & Checkpointing
+log_freq: 50
+save_freq: 0.004224
+eval_freq: 0.021124
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-baseline"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-lm1b-baseline
+
+# Misc
+seed: 42

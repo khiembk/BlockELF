@@ -1,0 +1,105 @@
+# Phase 1: block-to-block (fixed-commitment) revelation, LM1B (One Billion Word
+# Benchmark), commit size b=16. Unconditional task (no source) — the "stage 1,
+# predict the entire remaining-token set conditioned on context" method from
+# docs/main.tex, applied to plain language modeling instead of WMT14 translation:
+# `cond_seq_mask` is all-zero here (no source), so round k=0 reduces to the same
+# full-canvas unconditional generation OWT already does, and later rounds teacher-force
+# a growing committed prefix of already-generated text (see utils/block_utils.py and
+# train_step.py). Produced by src/scripts/prepare_lm1b.py (T5-tokenized, EOS-terminated,
+# one sentence per example, no packing — LM1B sentences are already short, unlike OWT's
+# long documents). Scaled for 2x H100 (80GB, shared with another job on this node).
+
+# Dataset
+data_path: "/scratch/khiem.tran@ad.wsu.edu/datasets/lm1b_t5/train"
+# No eval_data_path: like train_owt_ELF-B.yml, this makes run_generation dispatch to
+# test_generation_uncond (standard one-shot full-canvas sampling) as a per-epoch sanity
+# check; dedicated block-to-block eval is a separate step via eval_block_uncond.py.
+max_length: 128
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
+use_block_revelation: true
+block_size: 16
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 5.0  # matches train_owt_ELF-B.yml (unconditional task), not WMT14's 1.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+# No source to drop out (unconditional), so label_drop_prob stays at its 0.0 default.
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — scaled for 2x H100 (shared node; sized by memory
+# headroom, not compute, since the node's GPUs are already busy with another job).
+# global_batch_size=128 (per-device batch 64) hit RESOURCE_EXHAUSTED on this node
+# (~15.5GiB short) even though batch=32 (per-device 16) left ~8GB headroom; backed off
+# to global_batch_size=64 (per-device 32) and added grad_accum_steps=2 to keep the same
+# effective batch size (128) and optimizer-update count/LR schedule as originally
+# intended — `config.lr = blr * (global_batch_size * grad_accum_steps) / 256` is
+# unaffected, and warmup_steps=4000 raw steps / grad_accum_steps=2 = 2000 optimizer
+# warmup steps, matching the pre-fix intent.
+# LM1B train split is ~30.3M examples; steps_per_epoch = 30301028 // 64 = 473,453
+# (mini-batches; optimizer updates = 473453 // grad_accum_steps = 236,726 — same count
+# as the original global_batch_size=128 plan). One epoch alone is already ~3.4x the
+# optimizer-step count of the WMT14 block16 sanity run (70449 steps/epoch * 20 epochs),
+# so epochs=1 is a deliberately long run — adjust `epochs` or pass
+# --config_override epochs=N for a shorter sanity pass.
+epochs: 1
+global_batch_size: 64
+grad_accum_steps: 2
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 4000
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 200
+
+# Logging & Checkpointing
+# save_freq/eval_freq are fraction-of-epoch; with steps_per_epoch=473453:
+#   save every ~2000 steps  -> 2000 / 473453 ≈ 0.004224
+#   eval  every ~10000 steps -> 10000 / 473453 ≈ 0.021124 (online PPL eval is costly;
+#   kept less frequent than saving)
+log_freq: 50
+save_freq: 0.004224
+eval_freq: 0.021124
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-block16"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-lm1b-block16
+
+# Misc
+seed: 42
