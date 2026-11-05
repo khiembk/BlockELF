@@ -1,0 +1,104 @@
+# Phase 1 + staggered-noise, LM1B, commit size b=16. Identical to
+# train_lm1b_ELF-B_block16.yml (same data/model/compute budget) except
+# use_staggered_noise: true — a SetDLM-style single-pass multi-round training signal
+# adapted to continuous flow matching (see utils/block_utils.compute_staggered_timesteps
+# and modules/model.py's `t_pos` per-token conditioning). Instead of noising the entire
+# active region at one shared global timestep (one (committed boundary, noise level)
+# pair supervised per training step), positions near the commit boundary are noised at
+# a less-noisy effective timestep than positions far from it, so one forward pass packs
+# signal from many conceptual revelation rounds — the training-time motivation for why
+# the official Set Diffusion reference reaches much lower LM1B perplexity at a
+# comparable or smaller step budget. This is a training-only change: sampling/inference
+# is untouched (still one global `t` per round, per the Algorithm 2 contract), so
+# eval_block_uncond.py and generation.py work unmodified against checkpoints from this
+# config (the model's extra `pos_t_embedder` params simply go unused at inference).
+
+# Dataset
+data_path: "/scratch/khiem.tran@ad.wsu.edu/datasets/lm1b_t5/train"
+# No eval_data_path: like train_owt_ELF-B.yml, this makes run_generation dispatch to
+# test_generation_uncond (standard one-shot full-canvas sampling) as a per-epoch sanity
+# check; dedicated block-to-block eval is a separate step via eval_block_uncond.py.
+max_length: 128
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
+use_block_revelation: true
+block_size: 16
+
+# Staggered-noise training (the "core trick" from the SetDLM comparison). stagger_scale
+# is the max additive timestep boost applied right at the commit boundary, decaying
+# linearly back to 0 over the next `block_size` positions; 0.5 is a moderate starting
+# point (half the full [0,1] timestep range) — not tuned, a reasonable first guess.
+use_staggered_noise: true
+stagger_scale: 0.5
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 5.0  # matches train_owt_ELF-B.yml (unconditional task), not WMT14's 1.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+# No source to drop out (unconditional), so label_drop_prob stays at its 0.0 default.
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — identical budget to train_lm1b_ELF-B_block16.yml
+# for a direct, matched-compute comparison (see that file for the OOM-driven
+# batch+grad_accum derivation and steps_per_epoch math).
+epochs: 1
+global_batch_size: 64
+grad_accum_steps: 2
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 4000
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 200
+
+# Logging & Checkpointing
+# save_freq/eval_freq are fraction-of-epoch; with steps_per_epoch=473453:
+#   save every ~2000 steps  -> 2000 / 473453 ≈ 0.004224
+#   eval  every ~10000 steps -> 10000 / 473453 ≈ 0.021124 (online PPL eval is costly;
+#   kept less frequent than saving)
+log_freq: 50
+save_freq: 0.004224
+eval_freq: 0.021124
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-block16-staggered"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-lm1b-block16-staggered
+
+# Misc
+seed: 42

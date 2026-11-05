@@ -97,8 +97,13 @@ def main():
     input_dim = 2 * encoder_config.d_model if config.self_cond_prob > 0 else encoder_config.d_model
     dummy_x = jnp.ones((1, config.max_length, input_dim))
     dummy_self_cond_cfg_scale = jnp.ones((1,)) if config.num_self_cond_cfg_tokens > 0 else None
-    elf_params = model.init(init_rng, x=dummy_x, t=jnp.ones((1,)), deterministic=True,
-                             self_cond_cfg_scale=dummy_self_cond_cfg_scale)
+    init_kwargs = dict(x=dummy_x, t=jnp.ones((1,)), deterministic=True,
+                        self_cond_cfg_scale=dummy_self_cond_cfg_scale)
+    if config.use_block_revelation and config.use_staggered_noise:
+        # Must trace the t_pos branch at init time so pos_t_embedder's params exist
+        # for checkpoint restore to match a staggered-noise-trained checkpoint.
+        init_kwargs["t_pos"] = jnp.ones((1, config.max_length))
+    elf_params = model.init(init_rng, **init_kwargs)
 
     # Must match train.py's optimizer exactly (same `optimizer: muon/adamw` config) so
     # the opt_state pytree structure matches the checkpoint being restored.

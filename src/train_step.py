@@ -9,9 +9,9 @@ from utils.train_utils import TrainState
 from utils.encoder_utils import encode_text
 from utils.sampling_utils import (
     sample_cfg_scale, add_noise, sample_timesteps,
-    net_out_to_v_x, restore_cond,
+    net_out_to_v_x, restore_cond, broadcast_t,
 )
-from utils.block_utils import sample_block_round
+from utils.block_utils import sample_block_round, compute_staggered_timesteps
 
 
 Array = jnp.ndarray
@@ -85,14 +85,28 @@ def train_step(
     # cover the committed target prefix; everywhere else keeps using `cond_seq_mask`
     # unchanged (e.g. CFG label-drop below only ever drops the source sentence).
     clean_mask = cond_seq_mask
+    t_pos = None
     if config.use_block_revelation:
-        committed_mask_2d, active_mask_2d, _ = sample_block_round(
+        committed_mask_2d, active_mask_2d, boundary = sample_block_round(
             block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
         )
         clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
         loss_mask = active_mask_2d
+        if config.use_staggered_noise:
+            # SetDLM-style single-pass multi-round curriculum: positions near the commit
+            # boundary are noised at a less-noisy effective timestep than positions far
+            # from it, packing signal from many revelation rounds into one forward pass
+            # instead of one random round per step (see block_utils.py docstring).
+            t_pos = compute_staggered_timesteps(
+                t, active_mask_2d, boundary, config.block_size, config.stagger_scale,
+            )
 
-    denoiser_z = add_noise(x0, noise, t, config, cond_seq_mask=clean_mask)
+    # t_phys is the *physical* per-position noise level actually applied (scalar `t`
+    # when staggering is off, so this is a no-op in that case); `t` itself is kept
+    # unchanged throughout as the model's global prefix-token conditioning signal.
+    t_phys = t_pos if t_pos is not None else t
+
+    denoiser_z = add_noise(x0, noise, t_phys, config, cond_seq_mask=clean_mask)
 
     drop = batch["label_drop_mask"][:, None]
     if config.label_drop_prob > 0:
@@ -112,7 +126,7 @@ def train_step(
     decoder_noise = jax.random.normal(decoder_noise_rng, x0.shape, dtype=x0.dtype) * decoder_noise_scale
     decoder_z = decoder_lambda_t * x0 + (1 - decoder_lambda_t) * decoder_noise
 
-    t_expanded = t.reshape(-1, 1, 1)
+    t_expanded = broadcast_t(t_phys, ndim=3)
     v_target = (x0 - denoiser_z) / jnp.maximum(1 - t_expanded, t_eps)
 
     if self_cond_prob > 0:
@@ -131,19 +145,24 @@ def train_step(
     else:
         self_cond_cfg_scale = None
 
-    def get_z_input(params, z, t_input, self_cond_cfg_input, x_tokens):
-        # Self-conditioning: with probability self_cond_prob, compute initial estimate
+    def get_z_input(params, z, t_phys_in, self_cond_cfg_input, x_tokens):
+        # Self-conditioning: with probability self_cond_prob, compute initial estimate.
+        # `t_phys_in` is the physical (possibly per-position) effective timestep, used
+        # for the flow-matching math; the model call always gets the outer-scope global
+        # scalar `t` for its prefix-token conditioning, plus `t_pos` (None unless
+        # staggered-noise training is on) for the new per-token conditioning signal.
         if self_cond_prob == 0:
             return z
         z_uncond = restore_cond(jnp.zeros_like(z), x_tokens, clean_mask)
         z_with_zeros = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_init = state.apply_fn(
-            {"params": params}, z_with_zeros, t_input,
+            {"params": params}, z_with_zeros, t,
             deterministic=True,
             self_cond_cfg_scale=self_cond_cfg_input,
+            t_pos=t_pos,
         )
         net_out_init = jax.lax.stop_gradient(net_out_init)
-        _, x_pred_init = net_out_to_v_x(net_out_init, z, t_input, t_eps)
+        _, x_pred_init = net_out_to_v_x(net_out_init, z, t_phys_in, t_eps)
         x_pred_init = restore_cond(x_pred_init, x_tokens, clean_mask)
         x_pred_cond = x_pred_init * use_self_cond_mask.astype(z.dtype)
         x_pred_cond = restore_cond(x_pred_cond, x_tokens, clean_mask)
@@ -154,41 +173,42 @@ def train_step(
         safe_loss = jnp.where(loss_mask > 0, per_token_loss, jnp.zeros_like(per_token_loss))
         return (safe_loss * loss_mask).sum() / jnp.maximum(loss_mask.sum(), 1.0)
 
-    def get_sc_cond_and_uncond(params, z, t, cond_mask, x_tokens):
+    def get_sc_cond_and_uncond(params, z, t_phys_in, cond_mask, x_tokens):
         kwargs = {
             "self_cond_cfg_scale": self_cond_cfg_scale,
             "deterministic": True,
+            "t_pos": t_pos,
         }
         if config.self_cond_prob == 0:
             net_out_uncod = state.apply_fn({"params": params}, z, t, **kwargs)
-            v_uncond, _ = net_out_to_v_x(net_out_uncod, z, t, t_eps)
+            v_uncond, _ = net_out_to_v_x(net_out_uncod, z, t_phys_in, t_eps)
             return v_uncond, v_uncond
 
         z_uncond = restore_cond(jnp.zeros_like(z), x_tokens, cond_mask)
         z_input_uncond = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_uncond = state.apply_fn({"params": params}, z_input_uncond, t, **kwargs)
-        v_uncond, x_uncond = net_out_to_v_x(net_out_uncond, z, t, t_eps)
+        v_uncond, x_uncond = net_out_to_v_x(net_out_uncond, z, t_phys_in, t_eps)
         x_uncond = restore_cond(x_uncond, x_tokens, cond_mask)
 
         z_input_cond = jnp.concatenate([z, x_uncond], axis=-1)
         net_out_cond = state.apply_fn({"params": params}, z_input_cond, t, **kwargs)
-        v_cond, _ = net_out_to_v_x(net_out_cond, z, t, t_eps)
+        v_cond, _ = net_out_to_v_x(net_out_cond, z, t_phys_in, t_eps)
         return v_cond, v_uncond
 
-    def get_sc_guided_v(params, z, t, base_v_target, x_tokens):
+    def get_sc_guided_v(params, z, t_phys_in, base_v_target, x_tokens):
         """v target with self-conditioning guidance."""
         v_cond, v_uncond = get_sc_cond_and_uncond(
-            params, z, t, cond_mask=clean_mask, x_tokens=x_tokens
+            params, z, t_phys_in, cond_mask=clean_mask, x_tokens=x_tokens
         )
         sc_w = self_cond_cfg_scale.reshape(batch_size, 1, 1)
         sc_guidance = (1 - 1 / sc_w) * (v_cond - v_uncond)
         sc_guidance = jnp.where(use_self_cond_mask, sc_guidance, jnp.zeros_like(sc_guidance))
         return jax.lax.stop_gradient(base_v_target + sc_guidance)
 
-    def get_v_target(params, z, t, base_v_target, x_tokens):
+    def get_v_target(params, z, t_phys_in, base_v_target, x_tokens):
         """Compute final v target with self-conditioning guidance."""
         if config.num_self_cond_cfg_tokens > 0 and config.self_cond_prob > 0:
-            return get_sc_guided_v(params, z, t, base_v_target=base_v_target, x_tokens=x_tokens)
+            return get_sc_guided_v(params, z, t_phys_in, base_v_target=base_v_target, x_tokens=x_tokens)
         return base_v_target
 
     def loss_fn(params):
@@ -214,18 +234,23 @@ def train_step(
 
         def _denoiser_branch(_):
             # Denoiser mode: x0-noised latent (denoiser_z) at random t, L2 loss on velocity.
-            denoiser_t = t
+            # denoiser_t is the physical (possibly per-position, staggered) timestep used
+            # for the flow-matching math; the model's prefix-token conditioning always
+            # gets the outer-scope global scalar `t` (passed positionally below), plus
+            # `t_pos` (None unless staggered-noise training is on) for per-token signal.
+            denoiser_t = t_phys
             denoiser_input = get_z_input(
                 params, denoiser_z, denoiser_t,
                 self_cond_cfg_input=self_cond_cfg_scale,
                 x_tokens=x0,
             )
             net_out, _ = state.apply_fn(
-                {"params": params}, denoiser_input, denoiser_t,
+                {"params": params}, denoiser_input, t,
                 deterministic=False,
                 rngs={"dropout": model_dropout_rng},
                 self_cond_cfg_scale=self_cond_cfg_scale,
                 decoder_step_active=jnp.array(False),
+                t_pos=t_pos,
             )
             v_pred, _ = net_out_to_v_x(net_out, denoiser_z, denoiser_t, t_eps)
             v_final_target = get_v_target(

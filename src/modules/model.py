@@ -75,9 +75,17 @@ class ELF(nn.Module):
     @nn.compact
     def __call__(
         self, x, t, attention_mask=None, deterministic=True,
-        self_cond_cfg_scale=None, decoder_step_active=None,
+        self_cond_cfg_scale=None, decoder_step_active=None, t_pos=None,
     ):
-        """x: (N, S, C) or (N, S, 2C) with self-cond. t: (N,). attention_mask: (N, S), 1=valid."""
+        """x: (N, S, C) or (N, S, 2C) with self-cond. t: (N,). attention_mask: (N, S), 1=valid.
+
+        t_pos: optional (N, S) per-position effective timestep, added directly into the
+        content tokens (on top of the existing global `t` prefix-token conditioning) for
+        staggered-noise training (Adaptive BlockFlow Stage 1 + SetDLM-style single-pass
+        multi-round curriculum — see utils/block_utils.compute_staggered_timesteps).
+        None (default) for every existing non-staggered config/checkpoint: in that case
+        no extra params are created here and behavior is exactly as before.
+        """
         patch_size = 1
         head_dim = self.hidden_size // self.num_heads
         B = x.shape[0]
@@ -93,6 +101,10 @@ class ELF(nn.Module):
         x = BottleneckTextProj(
             self.text_encoder_dim, self.hidden_size, self.bottleneck_dim, name='text_proj',
         )(x)
+
+        if t_pos is not None:
+            pos_time_emb = TimestepEmbedder(self.hidden_size, name='pos_t_embedder')(t_pos)
+            x = x + pos_time_emb
 
         # Prepend learnable model-mode tokens (gated: zero unless decoder_step_active=True)
         model_mode_offset = 0

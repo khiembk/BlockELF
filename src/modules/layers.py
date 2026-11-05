@@ -117,13 +117,19 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        """Sinusoidal timestep embeddings: (N,) ints -> (N, dim) floats."""
+        """Sinusoidal timestep embeddings: (...,) floats -> (..., dim) floats.
+
+        Shape-generic (not just (N,) -> (N, dim)): also supports a per-position
+        timestep (N, S) -> (N, S, dim), used by the staggered-noise per-token
+        time conditioning (see modules/model.py's `t_pos`).
+        """
         half = dim // 2
         freqs = jnp.exp(-math.log(max_period) * jnp.arange(0, half, dtype=jnp.float32) / half)
-        args = t[:, None].astype(jnp.float32) * freqs[None]
+        freqs = freqs.reshape((1,) * t.ndim + (half,))
+        args = t[..., None].astype(jnp.float32) * freqs
         embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
         if dim % 2:
-            embedding = jnp.concatenate([embedding, jnp.zeros_like(embedding[:, :1])], axis=-1)
+            embedding = jnp.concatenate([embedding, jnp.zeros_like(embedding[..., :1])], axis=-1)
         return embedding
 
 

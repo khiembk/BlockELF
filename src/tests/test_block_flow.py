@@ -130,12 +130,18 @@ class _Config:
     grad_accum_steps = 1
     use_block_revelation = False
     block_size = 4
+    use_staggered_noise = False
+    stagger_scale = 0.5
 
 
-def _run_train_step(use_block_revelation, seed=0):
+def _run_train_step(use_block_revelation, seed=0, use_staggered_noise=False, return_state=False,
+                     decoder_prob=None, num_steps=1):
     vocab_size, d_model, seq_len, cond_len, batch_size = 37, 8, 20, 6, 4
     config = _Config()
     config.use_block_revelation = use_block_revelation
+    config.use_staggered_noise = use_staggered_noise
+    if decoder_prob is not None:
+        config.decoder_prob = decoder_prob
 
     rng = jax.random.PRNGKey(seed)
     rng, init_rng, dropout_rng, data_rng, enc_rng = jax.random.split(rng, 5)
@@ -151,10 +157,17 @@ def _run_train_step(use_block_revelation, seed=0):
         bottleneck_dim=4, num_time_tokens=2, num_self_cond_cfg_tokens=2, vocab_size=vocab_size,
     )
     dummy_x = jnp.ones((1, seq_len, 2 * d_model))
-    params = model.init(init_rng, x=dummy_x, t=jnp.ones((1,)), deterministic=True,
-                        self_cond_cfg_scale=jnp.ones((1,)))["params"]
+    init_kwargs = dict(x=dummy_x, t=jnp.ones((1,)), deterministic=True,
+                        self_cond_cfg_scale=jnp.ones((1,)))
+    if use_block_revelation and use_staggered_noise:
+        init_kwargs["t_pos"] = jnp.ones((1, seq_len))
+    params = model.init(init_rng, **init_kwargs)["params"]
 
-    lr_fn = create_learning_rate_fn(num_train_steps=10, num_warmup_steps=1, learning_rate=1e-3)
+    # num_warmup_steps=0: this test only ever takes a single step (step=0), and
+    # optax.linear_schedule returns exactly init_value=0.0 at step 0 whenever
+    # num_warmup_steps>=1 — i.e. every param (not just the one under test) would see
+    # zero effective LR and never move, regardless of gradient correctness.
+    lr_fn = create_learning_rate_fn(num_train_steps=10, num_warmup_steps=0, learning_rate=1e-3)
     import optax
     tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr_fn))
 
@@ -178,8 +191,21 @@ def _run_train_step(use_block_revelation, seed=0):
         lambda s, ep, b: train_step(s, ep, dummy_encoder.apply, b, config),
         axis_name="batch",
     )
-    new_state, metrics = p_train_step(state_r, encoder_params_r, batch)
+    # FinalLayer's output kernel is zero-initialized (see modules/layers.py) — at a
+    # freshly-initialized model this makes the Jacobian of the output w.r.t. *any*
+    # upstream hidden state exactly zero, so gradient flow into any upstream param
+    # (pos_t_embedder, t_embedder, text_proj, ...) is legitimately all-zero on the
+    # very first step, regardless of correctness. Only final_layer's own weights move
+    # on step 0; take `num_steps` so a gradient-flow check can look at the LAST step
+    # (by which point final_layer is no longer all-zero).
+    prev_state_r = state_r
+    for _ in range(num_steps):
+        prev_state_r = state_r
+        state_r, metrics = p_train_step(state_r, encoder_params_r, batch)
+    new_state = state_r
     metrics = jax.tree_util.tree_map(lambda x: float(x[0]), metrics)
+    if return_state:
+        return metrics, jax_utils.unreplicate(prev_state_r), jax_utils.unreplicate(new_state)
     return metrics
 
 
@@ -201,6 +227,51 @@ def test_train_step_block_mode_finite_loss():
         f"non-block active_frac ({np.mean(base_fracs):.3f})"
     )
     print(f"[OK] mean active_frac block={np.mean(block_fracs):.3f} vs non-block={np.mean(base_fracs):.3f}")
+
+
+def test_staggered_noise_finite_loss_and_trains_pos_embedder():
+    """Staggered-noise (SetDLM-style single-pass multi-round curriculum) sanity checks.
+
+    1. Finite loss, same active_frac invariants as plain block mode (staggering only
+       changes *which timestep* each active position is noised at, not which positions
+       are active/committed).
+    2. pos_t_embedder actually receives a nonzero gradient update — catches a silent
+       no-op if t_pos were accidentally not threaded into the model call.
+    3. Disabling staggering (use_staggered_noise=False) must not create any
+       pos_t_embedder params at all, preserving exact backward compatibility with
+       every existing (non-staggered) config/checkpoint.
+    """
+    # decoder_prob=0.0 forces the denoiser branch every step (jax.lax.cond only flows
+    # gradient through the branch actually taken at runtime) — pos_t_embedder only
+    # lives inside the denoiser branch, so leaving decoder_prob at its default would
+    # make this check flaky (zero gradient whenever the decoder branch got sampled).
+    # num_steps=2: FinalLayer's kernel is zero-initialized, so upstream gradient
+    # (pos_t_embedder, and every other pre-final-layer param) is legitimately zero on
+    # step 0 regardless of correctness; compare the state before vs. after the *second*
+    # step, by which point final_layer has moved off zero.
+    metrics, state, new_state = _run_train_step(
+        use_block_revelation=True, seed=2, use_staggered_noise=True, return_state=True,
+        decoder_prob=0.0, num_steps=2,
+    )
+    for k, v in metrics.items():
+        assert np.isfinite(v), f"non-finite metric {k}={v} (use_staggered_noise=True)"
+    assert 0.0 <= metrics["active_frac"] <= 1.0
+
+    assert "pos_t_embedder" in state.params, "pos_t_embedder params missing when use_staggered_noise=True"
+    old_leaves = jax.tree_util.tree_leaves(state.params["pos_t_embedder"])
+    new_leaves = jax.tree_util.tree_leaves(new_state.params["pos_t_embedder"])
+    changed = any(not np.allclose(o, n) for o, n in zip(old_leaves, new_leaves))
+    assert changed, "pos_t_embedder params did not change after a training step (gradient not flowing)"
+    print(f"[OK] staggered-noise train_step finite loss, pos_t_embedder trains: {metrics}")
+
+    # Backward compatibility: staggering off must not create pos_t_embedder at all.
+    _, state_off, _ = _run_train_step(
+        use_block_revelation=True, seed=2, use_staggered_noise=False, return_state=True,
+    )
+    assert "pos_t_embedder" not in state_off.params, (
+        "pos_t_embedder params unexpectedly present when use_staggered_noise=False"
+    )
+    print("[OK] use_staggered_noise=False creates no pos_t_embedder params (backward compatible)")
 
 
 def test_round_count_reweighting_fixes_bias():
@@ -246,5 +317,6 @@ def test_round_count_reweighting_fixes_bias():
 if __name__ == "__main__":
     test_sample_block_round_invariants()
     test_train_step_block_mode_finite_loss()
+    test_staggered_noise_finite_loss_and_trains_pos_embedder()
     test_round_count_reweighting_fixes_bias()
     print("\nAll block-flow sanity tests passed.")

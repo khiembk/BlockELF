@@ -9,9 +9,21 @@ from jax import Array
 # Noise Schedulers (how to compute z from x0 and noise)
 # ============================================
 
+def broadcast_t(t, ndim=3):
+    """Reshape a per-example (B,) or per-position (B, S) timestep for broadcasting
+    against a (B, S, D) latent tensor (or a (B, S) field, with ndim=2)."""
+    if t.ndim == 1:
+        return t.reshape((-1,) + (1,) * (ndim - 1))
+    return t[..., None] if ndim == 3 else t
+
+
 def add_noise(x0, noise, t, config, cond_seq_mask=None):
-    """Flow-matching interpolation z = t*x0 + (1-t)*noise*scale, preserving cond tokens."""
-    t_expanded = t.reshape(-1, 1, 1)
+    """Flow-matching interpolation z = t*x0 + (1-t)*noise*scale, preserving cond tokens.
+
+    `t` may be (B,) (one timestep per example, the default) or (B, S) (one timestep
+    per position, for staggered-noise training — see block_utils.compute_staggered_timesteps).
+    """
+    t_expanded = broadcast_t(t, ndim=3)
     z = t_expanded * x0 + (1 - t_expanded) * noise * config.denoiser_noise_scale
     if cond_seq_mask is not None:
         z = cond_seq_mask * x0 + (1 - cond_seq_mask) * z
@@ -115,7 +127,7 @@ def net_out_to_v_x(net_out, z, t, t_eps=5e-2):
     """
     if isinstance(net_out, tuple):
         net_out = net_out[0]
-    t_reshaped = t.reshape(-1, 1, 1)
+    t_reshaped = broadcast_t(t, ndim=3)
     x = net_out
     v = (x - z) / jnp.maximum(1.0 - t_reshaped, t_eps)
     return v, x

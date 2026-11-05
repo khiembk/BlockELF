@@ -67,6 +67,13 @@ class Config:
     use_block_revelation: bool = False
     block_size: int = 16  # Fixed commit size b
 
+    # Staggered-noise training (SetDLM-style single-pass multi-round curriculum).
+    # Only meaningful when use_block_revelation is also True. See
+    # utils/block_utils.compute_staggered_timesteps. 0.0 recovers the original
+    # uniform-t-across-active-region behavior exactly (no-op).
+    use_staggered_noise: bool = False
+    stagger_scale: float = 0.5
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch

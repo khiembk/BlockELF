@@ -161,6 +161,10 @@ def run_training(config):
         x=dummy_x, t=dummy_t, deterministic=True,
         self_cond_cfg_scale=dummy_self_cond_cfg_scale,
     )
+    if config.use_block_revelation and config.use_staggered_noise:
+        # Must trace the t_pos branch at init time so pos_t_embedder's params exist
+        # before train_step's apply_fn calls pass a real t_pos (see modules/model.py).
+        init_args["t_pos"] = jnp.ones((1, max_length))
     elf_params = model.init(init_rng, **init_args)
     log_for_0("\n" + model.tabulate(init_rng, **init_args))
     total_params = sum(x.size for x in jax.tree_util.tree_leaves(elf_params))

@@ -53,6 +53,43 @@ def sample_block_round(rng, cond_seq_mask, attention_mask, block_size: int):
     return committed_mask, active_mask, boundary
 
 
+def compute_staggered_timesteps(t_global, active_mask, boundary, block_size: int, stagger_scale: float):
+    """Per-position effective timestep for staggered-noise training (SetDLM-style
+    single-pass multi-round curriculum, adapted to continuous flow matching).
+
+    Instead of noising every active position at the same global `t_global` (one
+    (committed boundary, noise level) pair per training example — "one round per
+    step"), bias positions near the commit boundary toward a *less noisy* (larger)
+    effective timestep, decaying back to the plain `t_global` by `block_size`
+    positions out. A position right after the boundary (about to be committed next)
+    is thus trained more like "nearly resolved", while a position `block_size` or
+    more positions out is trained exactly as before — packing signal from many
+    conceptual revelation rounds into one forward pass instead of needing a separate
+    training step per round. Sampling/inference is unaffected (still one global `t`
+    per round, per the Algorithm 2 contract) — this is training-only.
+
+    Args:
+        t_global: (B,) per-example timestep, as already sampled by sample_timesteps.
+        active_mask: (B, S) float/bool, 1 at target positions to noise/supervise
+            this round (the `active_mask_2d` from sample_block_round).
+        boundary: (B,) float, absolute index of the first active position
+            (sample_block_round's third return value).
+        block_size: fixed commit size b (>=1) — the staggering window.
+        stagger_scale: max additive timestep boost at the boundary (0 disables
+            staggering, recovering the original uniform-t behavior exactly).
+
+    Returns:
+        t_pos: (B, S) float32 per-position effective timestep. 1.0 (fully resolved)
+            at non-active (source/committed/pad) positions.
+    """
+    active_mask = active_mask.astype(jnp.float32)
+    pos = jnp.arange(active_mask.shape[1], dtype=jnp.float32)[None, :]  # (1, S)
+    dist = pos - boundary[:, None]  # (B, S); 0 at first active position, grows rightward
+    offset = stagger_scale * jnp.clip(1.0 - dist / block_size, 0.0, 1.0)
+    t_pos_active = jnp.clip(t_global[:, None] + offset, 0.0, 1.0)
+    return jnp.where(active_mask > 0, t_pos_active, jnp.ones_like(t_pos_active))
+
+
 def build_committed_context(is_source, is_committed_target, is_valid, xp=jnp):
     """Build (encoder_attention_mask, attention_mask, clean_mask) for a fixed committed
     prefix, mirroring `encoder_utils.build_self_attn_cond_masks` but with "clean"
