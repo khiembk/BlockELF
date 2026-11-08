@@ -29,7 +29,7 @@ from datasets import Dataset
 from flax import jax_utils
 from flax.training.common_utils import shard
 
-from utils.block_utils import sample_block_round
+from utils.block_utils import sample_block_round, compute_staggered_timesteps, _staggered_bk
 from utils.data_utils import compute_block_round_counts
 from utils.encoder_utils import build_self_attn_cond_masks
 from utils.train_utils import TrainState, create_learning_rate_fn
@@ -131,7 +131,8 @@ class _Config:
     use_block_revelation = False
     block_size = 4
     use_staggered_noise = False
-    stagger_scale = 0.5
+    max_length = 20
+    max_input_length = None
 
 
 def _run_train_step(use_block_revelation, seed=0, use_staggered_noise=False, return_state=False,
@@ -229,6 +230,83 @@ def test_train_step_block_mode_finite_loss():
     print(f"[OK] mean active_frac block={np.mean(block_fracs):.3f} vs non-block={np.mean(base_fracs):.3f}")
 
 
+def test_staggered_timesteps_schedule_shape():
+    """Sanity-check the SetDLM-ported (b, k) derivation and the resulting per-position
+    schedule, independent of the full train_step machinery.
+
+    Reference numbers hand-derived from the actual `setdlms` repo's LM1B config
+    (desired_block_size=4, max_block_size=8, length=128): b≈0.05926, k≈0.35814. Our
+    own block_size=16/max_length=128 give different (still valid) numbers — checked
+    against an independent hand computation here, not the reference repo's own values.
+    """
+    b, k = _staggered_bk(desired_block_size=16.0, length=128.0)
+    # desired_num_blocks=8, desired_area=1/16=0.0625, max_block_size=32
+    # b = 32/(128+32-1) = 32/159; k = desired_area/(b-desired_area)
+    expected_b = 32.0 / 159.0
+    expected_k = 0.0625 / (expected_b - 0.0625)
+    assert abs(b - expected_b) < 1e-6, f"b={b} != expected {expected_b}"
+    assert abs(k - expected_k) < 1e-6, f"k={k} != expected {expected_k}"
+    assert 0.0 < b <= 1.0
+    print(f"[OK] _staggered_bk(16, 128): b={b:.5f}, k={k:.5f}")
+
+    # No cond (unconditional), single example, full 128-length target region
+    # (attention_mask all-ones -> real target length == target_capacity, matching the
+    # old fixed-target_capacity normalization exactly as a sanity check).
+    cond_seq_mask = jnp.zeros((1, 128))
+    attention_mask_full = jnp.ones((1, 128))
+    for t_global_val in [0.05, 0.3, 0.5, 0.7, 0.95]:
+        t_global = jnp.array([t_global_val])
+        t_pos = compute_staggered_timesteps(
+            t_global, cond_seq_mask, attention_mask_full, block_size=16, target_capacity=128,
+        )
+        t_pos_np = np.array(t_pos[0])
+        assert np.all(t_pos_np >= 0.0) and np.all(t_pos_np <= 1.0), "t_pos out of [0,1]"
+        # Monotonically non-increasing left-to-right (earlier positions resolve first).
+        assert np.all(np.diff(t_pos_np) <= 1e-6), (
+            f"t_pos not monotonically non-increasing at t_global={t_global_val}: {t_pos_np[:10]}..."
+        )
+        # The very first position should already be close to fully resolved once
+        # t_global is comfortably past 0 (b is small relative to the full canvas).
+        if t_global_val >= 0.3:
+            assert t_pos_np[0] > 0.9, f"t_pos[0]={t_pos_np[0]} should be ~1 at t_global={t_global_val}"
+        # The far end of a 128-long region shouldn't have started resolving yet
+        # unless t_global is already very large.
+        if t_global_val <= 0.5:
+            assert t_pos_np[-1] < 0.1, f"t_pos[-1]={t_pos_np[-1]} should be ~0 at t_global={t_global_val}"
+    print("[OK] compute_staggered_timesteps: monotonic, bounded, spans full [0,1] range across t_global")
+
+    # Regression check for the per-example-length normalization fix: a SHORT, padded
+    # example (35 real target tokens out of a 128 canvas, matching LM1B's mean length)
+    # must have its real content span the *full* [0, 1-b] schedule range -- i.e. its
+    # last real position should need t_global close to 1 to resolve, same as a
+    # full-length example's last position would -- not get crushed into the first ~21%
+    # of the range (the bug this test guards against: under the old fixed-
+    # target_capacity normalization, a short example's last real position was already
+    # FULLY resolved once t_global exceeded ~0.415, far too early).
+    real_len = 35
+    attention_mask_short = jnp.concatenate(
+        [jnp.ones((1, real_len)), jnp.zeros((1, 128 - real_len))], axis=1,
+    )
+    t_global_mid = jnp.array([0.5])
+    t_pos_short = compute_staggered_timesteps(
+        t_global_mid, cond_seq_mask, attention_mask_short, block_size=16, target_capacity=128,
+    )
+    t_pos_short_np = np.array(t_pos_short[0])
+    last_real_t_pos = t_pos_short_np[real_len - 1]
+    assert last_real_t_pos < 0.1, (
+        f"short-example last real position already resolving at t_global=0.5: "
+        f"{last_real_t_pos} (should be ~0 -- per-example length normalization not applied?)"
+    )
+    # Sanity: that same position DOES fully resolve once t_global approaches 1.
+    t_pos_short_end = compute_staggered_timesteps(
+        jnp.array([1.0]), cond_seq_mask, attention_mask_short, block_size=16, target_capacity=128,
+    )
+    assert np.array(t_pos_short_end[0])[real_len - 1] > 0.9, (
+        "short-example last real position should fully resolve by t_global=1.0"
+    )
+    print("[OK] compute_staggered_timesteps: short padded example spans the full schedule range")
+
+
 def test_staggered_noise_finite_loss_and_trains_pos_embedder():
     """Staggered-noise (SetDLM-style single-pass multi-round curriculum) sanity checks.
 
@@ -317,6 +395,7 @@ def test_round_count_reweighting_fixes_bias():
 if __name__ == "__main__":
     test_sample_block_round_invariants()
     test_train_step_block_mode_finite_loss()
+    test_staggered_timesteps_schedule_shape()
     test_staggered_noise_finite_loss_and_trains_pos_embedder()
     test_round_count_reweighting_fixes_bias()
     print("\nAll block-flow sanity tests passed.")

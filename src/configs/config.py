@@ -67,12 +67,14 @@ class Config:
     use_block_revelation: bool = False
     block_size: int = 16  # Fixed commit size b
 
-    # Staggered-noise training (SetDLM-style single-pass multi-round curriculum).
-    # Only meaningful when use_block_revelation is also True. See
-    # utils/block_utils.compute_staggered_timesteps. 0.0 recovers the original
-    # uniform-t-across-active-region behavior exactly (no-op).
+    # Staggered-noise training — a faithful port of SetDLM's StaggeredNoise schedule
+    # (see utils/block_utils.compute_staggered_timesteps / _staggered_bk), only
+    # meaningful when use_block_revelation is also True. Replaces the discrete
+    # per-round committed/active split with one smooth, closed-form, whole-target-
+    # region schedule; its shape is derived deterministically from block_size and
+    # max_length (matching the reference repo's own convention) — no separate
+    # intensity knob to tune.
     use_staggered_noise: bool = False
-    stagger_scale: float = 0.5
 
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step

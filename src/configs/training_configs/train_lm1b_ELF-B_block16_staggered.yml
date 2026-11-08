@@ -1,17 +1,51 @@
 # Phase 1 + staggered-noise, LM1B, commit size b=16. Identical to
 # train_lm1b_ELF-B_block16.yml (same data/model/compute budget) except
-# use_staggered_noise: true — a SetDLM-style single-pass multi-round training signal
-# adapted to continuous flow matching (see utils/block_utils.compute_staggered_timesteps
-# and modules/model.py's `t_pos` per-token conditioning). Instead of noising the entire
-# active region at one shared global timestep (one (committed boundary, noise level)
-# pair supervised per training step), positions near the commit boundary are noised at
-# a less-noisy effective timestep than positions far from it, so one forward pass packs
-# signal from many conceptual revelation rounds — the training-time motivation for why
-# the official Set Diffusion reference reaches much lower LM1B perplexity at a
-# comparable or smaller step budget. This is a training-only change: sampling/inference
-# is untouched (still one global `t` per round, per the Algorithm 2 contract), so
-# eval_block_uncond.py and generation.py work unmodified against checkpoints from this
-# config (the model's extra `pos_t_embedder` params simply go unused at inference).
+# use_staggered_noise: true.
+#
+# v2 (this file): a faithful port of the reference `setdlms` repo's actual
+# StaggeredNoise mechanism (src/noise_schedule/noise_schedules.py), not an
+# approximation of it. There is no discrete per-round committed/active split at all —
+# every target position gets its own continuous, closed-form effective timestep,
+# smoothly and monotonically increasing left-to-right across the *entire* target
+# region as a function of one globally-sampled t and the position's absolute rank
+# (see utils/block_utils.compute_staggered_timesteps / _staggered_bk). The schedule's
+# width/shape (b, k) are derived deterministically from block_size and max_length,
+# matching the reference repo's own LM1B convention exactly (their `desired_block_size`
+# = our `block_size`, their `length` = our `max_length`) — no free intensity knob.
+#
+# v1 (superseded, do not reuse): an earlier, cruder approximation that only boosted
+# positions within one `block_size` window of a *sampled discrete commit boundary*,
+# with a hard cliff back to the plain global t beyond that window, controlled by a
+# free `stagger_scale` knob. That version caused severe, scale-insensitive training
+# instability on LM1B — stagger_scale=0.5 collapsed into single-word repetition loops
+# in 93/100 samples by checkpoint_32000 (Gen. PPL=4.6 looked deceptively great — GPT2
+# scores "repeat the same token forever" as highly likely — but entropy=0.92 and manual
+# inspection showed total collapse); stagger_scale=0.1 reduced but did not fix it
+# (69/100 collapsed at a comparable step), and even after the collapse resolved by
+# step 188k, Gen. PPL (1263) remained far worse than the non-staggered baseline at a
+# comparable point (168 at a similar training fraction). The localized boost + hard
+# cliff was a real invention, not SetDLM's validated design — this file replaces it.
+#
+# v3 (this file, bug fix on top of v2): v2's `compute_staggered_timesteps` normalized
+# each position's rank by the FIXED `target_capacity` (128), not by that example's own
+# real (unpadded) target length. LM1B sentences are short (mean ~35 tokens) and are
+# tokenized one-per-example (not packed/wrapped) into the 128-token canvas, so for a
+# typical example almost all of its real content got crushed into the first ~21% of the
+# schedule's [0, 1-b] range while padding occupied the unused rest — and, since that
+# crushed fraction varies with each example's own length, different examples effectively
+# trained under inconsistent schedules despite sharing the same `t_global` distribution.
+# v2 did fix v1's severe collapse pathology (0-6% single-word-collapse vs. v1's 69-93%),
+# but still showed large, unexplained Gen. PPL swings across checkpoints (108k=1431.7,
+# 150k=1603.7, 248k=4950.9) that this length-normalization bug plausibly explains. The
+# fix: normalize each position's rank by that example's own real target length (from
+# `attention_mask`), not the fixed canvas size — `b`/`k` (schedule width/shape) still
+# come from the fixed target_capacity, matching the reference repo's block_size
+# granularity. See `utils/block_utils.compute_staggered_timesteps` for the exact change.
+#
+# This remains a training-only change: sampling/inference is untouched (still one
+# global `t` per round, per the Algorithm 2 contract), so eval_block_uncond.py and
+# generation.py work unmodified against checkpoints from this config (the model's
+# extra `pos_t_embedder` params simply go unused at inference).
 
 # Dataset
 data_path: "/scratch/khiem.tran@ad.wsu.edu/datasets/lm1b_t5/train"
@@ -45,12 +79,10 @@ time_schedule: "logit_normal"
 use_block_revelation: true
 block_size: 16
 
-# Staggered-noise training (the "core trick" from the SetDLM comparison). stagger_scale
-# is the max additive timestep boost applied right at the commit boundary, decaying
-# linearly back to 0 over the next `block_size` positions; 0.5 is a moderate starting
-# point (half the full [0,1] timestep range) — not tuned, a reasonable first guess.
+# Staggered-noise training (the "core trick" from the SetDLM comparison) — see the
+# top-of-file note for the v1->v2 history. No stagger_scale here: (b, k) are derived
+# deterministically from block_size/max_length (see _staggered_bk).
 use_staggered_noise: true
-stagger_scale: 0.5
 
 # Decoder objective
 decoder_prob: 0.2
@@ -90,7 +122,10 @@ save_freq: 0.004224
 eval_freq: 0.021124
 
 # Output
-output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-block16-staggered"
+# New output_dir (not v1's or v2's) — the staggered-schedule computation itself
+# changed (per-example length normalization bug fix), so auto-resume must not pick up
+# the old (buggy) checkpoints.
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-block16-staggered-v3"
 hf_repo_id: null
 resume: null
 
@@ -98,7 +133,7 @@ resume: null
 use_wandb: false
 wandb_project: elf
 wandb_entity:
-wandb_run_name: elf_b-lm1b-block16-staggered
+wandb_run_name: elf_b-lm1b-block16-staggered-v3
 
 # Misc
 seed: 42

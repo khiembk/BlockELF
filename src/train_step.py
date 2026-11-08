@@ -87,19 +87,24 @@ def train_step(
     clean_mask = cond_seq_mask
     t_pos = None
     if config.use_block_revelation:
-        committed_mask_2d, active_mask_2d, boundary = sample_block_round(
-            block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
-        )
-        clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
-        loss_mask = active_mask_2d
         if config.use_staggered_noise:
-            # SetDLM-style single-pass multi-round curriculum: positions near the commit
-            # boundary are noised at a less-noisy effective timestep than positions far
-            # from it, packing signal from many revelation rounds into one forward pass
-            # instead of one random round per step (see block_utils.py docstring).
+            # Faithful SetDLM-style schedule (see block_utils.compute_staggered_timesteps):
+            # every target position gets its own continuous, smoothly-varying effective
+            # timestep in one pass — no discrete per-round committed/active split, no
+            # sample_block_round call, at all. clean_mask/loss_mask therefore stay at
+            # their pre-block-revelation defaults (source-only clean, all valid target
+            # positions supervised); add_noise's existing cond_seq_mask override still
+            # forces source positions clean regardless of what the schedule says there.
+            target_capacity = config.max_length - (config.max_input_length or 0)
             t_pos = compute_staggered_timesteps(
-                t, active_mask_2d, boundary, config.block_size, config.stagger_scale,
+                t, batch["cond_seq_mask"], batch["attention_mask"], config.block_size, target_capacity,
             )
+        else:
+            committed_mask_2d, active_mask_2d, boundary = sample_block_round(
+                block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
+            )
+            clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
+            loss_mask = active_mask_2d
 
     # t_phys is the *physical* per-position noise level actually applied (scalar `t`
     # when staggering is off, so this is a no-op in that case); `t` itself is kept
