@@ -93,7 +93,7 @@ def main():
         attn_drop=config.attn_dropout, proj_drop=config.proj_dropout,
         num_time_tokens=config.num_time_tokens, num_self_cond_cfg_tokens=config.num_self_cond_cfg_tokens,
         vocab_size=vocab_size, num_model_mode_tokens=config.num_model_mode_tokens,
-        bottleneck_dim=config.bottleneck_dim,
+        bottleneck_dim=config.bottleneck_dim, use_position_time=config.use_staggered_time,
     )
     input_dim = 2 * encoder_config.d_model if config.self_cond_prob > 0 else encoder_config.d_model
     dummy_x = jnp.ones((1, config.max_length, input_dim))
@@ -126,6 +126,13 @@ def main():
             break
         source_ids = jnp.array(batch["input_ids"])[:, :config.max_input_length]
         source_lengths = jnp.array(batch["cond_seq_mask"]).astype(jnp.int32).sum(axis=1)
+        # Fix B (prerequisite): batch["input_ids"] is packed TIGHT as
+        # [source][target][pad] (see data_utils.py's collate_fn), so a naive
+        # fixed-width prefix leaks real ground-truth TARGET tokens into source_ids
+        # whenever source_lengths[i] < max_input_length. Mask anything past each row's
+        # real source length back to pad, so generation never sees reference content.
+        src_pos = jnp.arange(config.max_input_length)[None, :]
+        source_ids = jnp.where(src_pos < source_lengths[:, None], source_ids, pad_token_id)
 
         rng, gen_rng = jax.random.split(rng)
         texts = generate_block_cond(

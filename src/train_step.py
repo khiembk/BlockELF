@@ -11,7 +11,7 @@ from utils.sampling_utils import (
     sample_cfg_scale, add_noise, sample_timesteps,
     net_out_to_v_x, restore_cond,
 )
-from utils.block_utils import sample_block_round
+from utils.block_utils import sample_block_round, compute_staggered_timesteps, build_committed_context
 
 
 Array = jnp.ndarray
@@ -40,8 +40,66 @@ def train_step(
         decoder_lambda_rng, decoder_noise_rng, block_rng,
     ) = jax.random.split(current_step_rng, 10)
 
-    # encoder_attention_mask: cond sees cond, x sees all
+    batch_size, seq_length = batch["input_ids"].shape
+
+    cond_seq_mask = batch["cond_seq_mask"][:, :, None]
+    attention_mask = batch["attention_mask"]
+    if config.pad_token == "pad":
+        loss_mask = attention_mask
+    else:
+        loss_mask = jnp.ones_like(attention_mask)
+    loss_mask = loss_mask * (1 - batch["cond_seq_mask"])
+
+    # encoder_attention_mask: cond sees cond, x sees all (legacy default — used
+    # whenever block revelation is off or use_staggered_time is on; see below).
     encoder_attention_mask = batch["encoder_attention_mask"]
+
+    # Block-to-block (fixed-commitment) revelation: teacher-force a committed target
+    # prefix {1,...,k*b} this round and restrict noise/loss to the remaining ("active")
+    # target positions. `clean_mask` generalizes `cond_seq_mask` (source-only) to also
+    # cover the committed target prefix; everywhere else keeps using `cond_seq_mask`
+    # unchanged (e.g. CFG label-drop below only ever drops the source sentence).
+    #
+    # use_staggered_time replaces this discrete per-round commit/active split entirely
+    # (mutually exclusive with it, not layered on top): every target position gets its
+    # own continuous effective timestep in one pass (see compute_staggered_timesteps),
+    # so clean_mask/loss_mask stay at their pre-block-revelation defaults (source-only
+    # clean, every valid target position supervised) — add_noise's cond_seq_mask
+    # override still forces source positions clean regardless. No committed/active
+    # split exists in this path, so neither Fix A's encoder leak nor Fix C's
+    # role-masking applies here: encoder_attention_mask stays the legacy default,
+    # role_clean_mask stays None (unrestricted attention, as every staggered-time
+    # checkpoint already trains with).
+    clean_mask = cond_seq_mask
+    role_clean_mask = None
+    t_position_delta = jnp.zeros((batch_size, seq_length))
+    if config.use_block_revelation and not config.use_staggered_time:
+        committed_mask_2d, active_mask_2d, boundary = sample_block_round(
+            block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
+        )
+        clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
+        loss_mask = active_mask_2d
+        # Fix A: the committed/active split must be sampled BEFORE the frozen T5
+        # encoder runs, and the encoder's own self-attention must respect it (clean
+        # queries see only clean keys; active queries see everything valid) —
+        # otherwise the "committed" embeddings encode_text produces are
+        # contextualized with bidirectional access to the as-yet-unrevealed active
+        # target region, something inference's build_committed_context (re-encoding
+        # only actually-generated tokens each round) can never replicate.
+        encoder_attention_mask, _, _ = build_committed_context(
+            is_source=batch["cond_seq_mask"] > 0,
+            is_committed_target=committed_mask_2d > 0,
+            is_valid=attention_mask > 0,
+        )
+        # Fix C: the ELF denoiser's own self-attention must respect the same
+        # clean/active role split — clean (source + committed) queries' hidden
+        # states must stay invariant to this step's randomly-sampled active-region
+        # noise, which the same fresh-re-encode-of-committed-context argument above
+        # applies to just as much. role_clean_mask is combined with the plain
+        # validity `attention_mask` inside the model (both role AND padding-key
+        # exclusion), since the ELF denoiser previously received no attention mask
+        # at all (fully unmasked, including padding) outside this new path.
+        role_clean_mask = clean_mask[:, :, 0]
 
     # Label drop before encoding: prevent target tokens from attending to
     # condition tokens so x0 is truly unconditional for dropped samples.
@@ -61,8 +119,6 @@ def train_step(
         latent_std=latent_std,
     )
 
-    batch_size, seq_length = x0.shape[0], x0.shape[1]
-
     t = sample_timesteps(
         t_rng, batch_size,
         P_mean=config.denoiser_p_mean, P_std=config.denoiser_p_std,
@@ -71,28 +127,22 @@ def train_step(
 
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)
 
-    cond_seq_mask = batch["cond_seq_mask"][:, :, None]
-    attention_mask = batch["attention_mask"]
-    if config.pad_token == "pad":
-        loss_mask = attention_mask
-    else:
-        loss_mask = jnp.ones_like(attention_mask)
-    loss_mask = loss_mask * (1 - batch["cond_seq_mask"])
-
-    # Block-to-block (fixed-commitment) revelation: teacher-force a committed target
-    # prefix {1,...,k*b} this round and restrict noise/loss to the remaining ("active")
-    # target positions. `clean_mask` generalizes `cond_seq_mask` (source-only) to also
-    # cover the committed target prefix; everywhere else keeps using `cond_seq_mask`
-    # unchanged (e.g. CFG label-drop below only ever drops the source sentence).
-    clean_mask = cond_seq_mask
-    if config.use_block_revelation:
-        committed_mask_2d, active_mask_2d, _ = sample_block_round(
-            block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
+    if config.use_block_revelation and config.use_staggered_time:
+        target_capacity = config.max_length - (config.max_input_length or 0)
+        t_position_delta = compute_staggered_timesteps(
+            t, batch["cond_seq_mask"], batch["attention_mask"], config.block_size, target_capacity,
         )
-        clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
-        loss_mask = active_mask_2d
+    t_position = jnp.clip(t[:, None] + t_position_delta, 0.0, 1.0)
+    t_position_delta = t_position - t[:, None]  # re-derive post-clip, for model conditioning
 
-    denoiser_z = add_noise(x0, noise, t, config, cond_seq_mask=clean_mask)
+    # Only pass a real (padding-excluding) attention_mask to the ELF denoiser's own
+    # self-attention when role_clean_mask is also active (Fix C) — the model combines
+    # the two into one role+validity mask (see modules/model.py). Every other path
+    # (non-block, staggered-time) keeps attention_mask=None, i.e. fully unmasked
+    # self-attention, matching every checkpoint already trained that way.
+    denoiser_attention_mask = attention_mask if role_clean_mask is not None else None
+
+    denoiser_z = add_noise(x0, noise, t_position, config, cond_seq_mask=clean_mask)
 
     drop = batch["label_drop_mask"][:, None]
     if config.label_drop_prob > 0:
@@ -112,8 +162,8 @@ def train_step(
     decoder_noise = jax.random.normal(decoder_noise_rng, x0.shape, dtype=x0.dtype) * decoder_noise_scale
     decoder_z = decoder_lambda_t * x0 + (1 - decoder_lambda_t) * decoder_noise
 
-    t_expanded = t.reshape(-1, 1, 1)
-    v_target = (x0 - denoiser_z) / jnp.maximum(1 - t_expanded, t_eps)
+    t_position_expanded = t_position[:, :, None]
+    v_target = (x0 - denoiser_z) / jnp.maximum(1 - t_position_expanded, t_eps)
 
     if self_cond_prob > 0:
         use_self_cond_mask = (
@@ -132,18 +182,24 @@ def train_step(
         self_cond_cfg_scale = None
 
     def get_z_input(params, z, t_input, self_cond_cfg_input, x_tokens):
-        # Self-conditioning: with probability self_cond_prob, compute initial estimate
+        # Self-conditioning: with probability self_cond_prob, compute initial estimate.
+        # `t_input` (scalar per example) drives the model's prefix-token conditioning;
+        # `t_position`/`t_position_delta` (closure vars) drive the actual noise/velocity
+        # math and the model's new per-position pathway, respectively.
         if self_cond_prob == 0:
             return z
         z_uncond = restore_cond(jnp.zeros_like(z), x_tokens, clean_mask)
         z_with_zeros = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_init = state.apply_fn(
             {"params": params}, z_with_zeros, t_input,
+            attention_mask=denoiser_attention_mask,
             deterministic=True,
             self_cond_cfg_scale=self_cond_cfg_input,
+            t_position_delta=t_position_delta,
+            role_clean_mask=role_clean_mask,
         )
         net_out_init = jax.lax.stop_gradient(net_out_init)
-        _, x_pred_init = net_out_to_v_x(net_out_init, z, t_input, t_eps)
+        _, x_pred_init = net_out_to_v_x(net_out_init, z, t_position, t_eps)
         x_pred_init = restore_cond(x_pred_init, x_tokens, clean_mask)
         x_pred_cond = x_pred_init * use_self_cond_mask.astype(z.dtype)
         x_pred_cond = restore_cond(x_pred_cond, x_tokens, clean_mask)
@@ -155,24 +211,29 @@ def train_step(
         return (safe_loss * loss_mask).sum() / jnp.maximum(loss_mask.sum(), 1.0)
 
     def get_sc_cond_and_uncond(params, z, t, cond_mask, x_tokens):
+        # `t` (scalar) drives the model's prefix-token conditioning; `t_position`
+        # (closure var) drives the velocity-conversion math (see get_z_input).
         kwargs = {
+            "attention_mask": denoiser_attention_mask,
             "self_cond_cfg_scale": self_cond_cfg_scale,
             "deterministic": True,
+            "t_position_delta": t_position_delta,
+            "role_clean_mask": role_clean_mask,
         }
         if config.self_cond_prob == 0:
             net_out_uncod = state.apply_fn({"params": params}, z, t, **kwargs)
-            v_uncond, _ = net_out_to_v_x(net_out_uncod, z, t, t_eps)
+            v_uncond, _ = net_out_to_v_x(net_out_uncod, z, t_position, t_eps)
             return v_uncond, v_uncond
 
         z_uncond = restore_cond(jnp.zeros_like(z), x_tokens, cond_mask)
         z_input_uncond = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_uncond = state.apply_fn({"params": params}, z_input_uncond, t, **kwargs)
-        v_uncond, x_uncond = net_out_to_v_x(net_out_uncond, z, t, t_eps)
+        v_uncond, x_uncond = net_out_to_v_x(net_out_uncond, z, t_position, t_eps)
         x_uncond = restore_cond(x_uncond, x_tokens, cond_mask)
 
         z_input_cond = jnp.concatenate([z, x_uncond], axis=-1)
         net_out_cond = state.apply_fn({"params": params}, z_input_cond, t, **kwargs)
-        v_cond, _ = net_out_to_v_x(net_out_cond, z, t, t_eps)
+        v_cond, _ = net_out_to_v_x(net_out_cond, z, t_position, t_eps)
         return v_cond, v_uncond
 
     def get_sc_guided_v(params, z, t, base_v_target, x_tokens):
@@ -222,12 +283,15 @@ def train_step(
             )
             net_out, _ = state.apply_fn(
                 {"params": params}, denoiser_input, denoiser_t,
+                attention_mask=denoiser_attention_mask,
                 deterministic=False,
                 rngs={"dropout": model_dropout_rng},
                 self_cond_cfg_scale=self_cond_cfg_scale,
                 decoder_step_active=jnp.array(False),
+                t_position_delta=t_position_delta,
+                role_clean_mask=role_clean_mask,
             )
-            v_pred, _ = net_out_to_v_x(net_out, denoiser_z, denoiser_t, t_eps)
+            v_pred, _ = net_out_to_v_x(net_out, denoiser_z, t_position, t_eps)
             v_final_target = get_v_target(
                 params, denoiser_z, denoiser_t, base_v_target=v_target, x_tokens=x0,
             )

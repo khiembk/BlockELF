@@ -9,9 +9,22 @@ from jax import Array
 # Noise Schedulers (how to compute z from x0 and noise)
 # ============================================
 
+def _expand_t(t):
+    """(B,) -> (B,1,1) or (B,S) -> (B,S,1), for broadcasting against (B,S,C) arrays."""
+    if t.ndim == 1:
+        return t[:, None, None]
+    if t.ndim == 2:
+        return t[:, :, None]
+    raise ValueError(f"Unexpected t.ndim={t.ndim}; expected 1 (per-example) or 2 (per-position).")
+
+
 def add_noise(x0, noise, t, config, cond_seq_mask=None):
-    """Flow-matching interpolation z = t*x0 + (1-t)*noise*scale, preserving cond tokens."""
-    t_expanded = t.reshape(-1, 1, 1)
+    """Flow-matching interpolation z = t*x0 + (1-t)*noise*scale, preserving cond tokens.
+
+    `t` may be (B,) (one time per example, the common case) or (B,S) (one time per
+    position, used for staggered/per-position time training augmentation).
+    """
+    t_expanded = _expand_t(t)
     z = t_expanded * x0 + (1 - t_expanded) * noise * config.denoiser_noise_scale
     if cond_seq_mask is not None:
         z = cond_seq_mask * x0 + (1 - cond_seq_mask) * z
@@ -112,10 +125,11 @@ def net_out_to_v_x(net_out, z, t, t_eps=5e-2):
 
     When the model returns a tuple (denoised_output, decoder_logits),
     decoder logits are discarded here (used separately in training).
+    `t` may be (B,) or (B,S) — see add_noise.
     """
     if isinstance(net_out, tuple):
         net_out = net_out[0]
-    t_reshaped = t.reshape(-1, 1, 1)
+    t_reshaped = _expand_t(t)
     x = net_out
     v = (x - z) / jnp.maximum(1.0 - t_reshaped, t_eps)
     return v, x

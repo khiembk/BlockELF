@@ -67,6 +67,18 @@ class Config:
     use_block_revelation: bool = False
     block_size: int = 16  # Fixed commit size b
 
+    # Staggered per-position time (a faithful port of SetDLM's StaggeredNoise schedule —
+    # see utils/block_utils.compute_staggered_timesteps / _staggered_bk), adapted to
+    # ELF's continuous Gaussian flow. Replaces the discrete per-round committed/active
+    # split (use_block_revelation's sample_block_round) with one smooth, closed-form
+    # schedule spanning the whole target region in a single pass; its shape is derived
+    # deterministically from block_size and max_length/max_input_length — no separate
+    # intensity knob to tune. Requires use_position_time=True on the model (new,
+    # zero-initialized params — see modules/model.py) so existing checkpoints remain
+    # structurally loadable via utils.checkpoint_utils.merge_pretrained_params.
+    # Training-only; inference (utils/generation_utils.py) is unaffected (always delta=0).
+    use_staggered_time: bool = False
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch
@@ -119,6 +131,12 @@ class Config:
     output_dir: str = "./output_dir"
     hf_repo_id: str = None  # Optional HF repo id to mirror local outputs/checkpoints.
     resume: str = None
+    # Warm-start: load only params/ema_params1 from a pretrained checkpoint (local path or
+    # HF repo id) at the start of a fresh run — optimizer state, step, and epoch stay at
+    # their fresh-init values. Distinct from `resume`, which restores everything (for
+    # continuing an interrupted run of *this* experiment). Only applied when there is no
+    # local checkpoint to auto-resume from and `resume` isn't explicitly set.
+    warm_start_checkpoint: str = None
 
     # Wandb
     use_wandb: bool = False

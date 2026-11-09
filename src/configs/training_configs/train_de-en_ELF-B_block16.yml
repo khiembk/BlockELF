@@ -71,6 +71,11 @@ eval_freq: 5
 output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16"
 hf_repo_id: null
 resume: null
+# Warm-start from the pretrained (non-block) ELF-B WMT14 De-En checkpoint (BLEU~26.4),
+# architecturally identical to this config (same model/bottleneck_dim/num_time_tokens/
+# num_self_cond_cfg_tokens/num_model_mode_tokens/max_length/encoder). Only params +
+# ema_params1 are loaded; optimizer state/step/epoch start fresh.
+warm_start_checkpoint: "embedded-language-flows/ELF-B-de-en"
 
 # Wandb
 use_wandb: false

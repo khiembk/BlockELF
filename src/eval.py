@@ -31,7 +31,7 @@ from utils.logging_utils import log_for_0
 from utils.checkpoint_utils import load_encoder_checkpoint, load_checkpoint
 from utils.train_utils import TrainState
 from utils.data_utils import load_jsonl_dataset, load_dataset_split, get_pad_token_id
-from generation import test_generation_uncond, test_generation_cond
+from generation import run_generation
 from configs.config import load_config_from_yaml, apply_config_overrides, load_sampling_configs
 
 logging.basicConfig(
@@ -218,28 +218,17 @@ def main():
         if len(seed_list) > 1:
             config.output_dir = os.path.join(original_output_dir, f"seed_{seed_val}")
 
-        for sc_idx, sc in enumerate(config.sampling_configs):
-            if len(config.sampling_configs) > 1:
-                log_for_0(f"\n--- Sampling config {sc_idx + 1}/{len(config.sampling_configs)} ---")
-            seed_rng, sample_rng = jax.random.split(seed_rng)
-            common_kwargs = dict(
-                state=state_replicated,
-                tokenizer=tokenizer,
-                rng=sample_rng,
-                config=config,
-                sampling_config=sc,
-                batch_size=local_batch_size,
-                num_samples=config.num_samples,
-            )
-            if eval_dataset is None:
-                test_generation_uncond(**common_kwargs)
-            else:
-                test_generation_cond(
-                    **common_kwargs,
-                    encoder_params=encoder_params,
-                    encoder_apply_fn=encoder_model.apply,
-                    dataset=eval_dataset,
-                )
+        # Fix D: route through run_generation (not a duplicated inline loop calling
+        # test_generation_cond/uncond directly) so this script and training's own
+        # periodic eval dispatch identically — in particular so this correctly runs
+        # the block-to-block samplers when config.use_block_revelation is set, instead
+        # of always running the original one-shot full-sequence sampler regardless of
+        # config (the confirmed Fix D bug).
+        seed_rng = run_generation(
+            state=state_replicated, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
+            eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
+            rng=seed_rng, local_batch_size=local_batch_size,
+        )
 
         config.output_dir = original_output_dir
 

@@ -34,7 +34,7 @@ from modules.t5_encoder import get_encoder
 from utils.logging_utils import log_for_0
 from utils.checkpoint_utils import (
     save_checkpoint, load_encoder_checkpoint, load_checkpoint,
-    find_latest_checkpoint,
+    find_latest_checkpoint, merge_pretrained_params,
 )
 from utils.train_utils import (
     TrainState, prefetch_to_device, get_optimizer, create_learning_rate_fn,
@@ -154,6 +154,7 @@ def run_training(config):
         vocab_size=vocab_size,
         num_model_mode_tokens=config.num_model_mode_tokens,
         bottleneck_dim=config.bottleneck_dim,
+        use_position_time=config.use_staggered_time,
     )
 
     log_for_0("Initializing ELF model...")
@@ -225,6 +226,44 @@ def run_training(config):
     )
     total_trainable = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
     log_for_0(f"Total trainable parameters: {total_trainable:,}")
+
+    # Warm-start: load pretrained params/ema_params1 only (fresh optimizer/step/epoch),
+    # before the auto-resume check so a later interrupted-run restart correctly resumes
+    # from *this* experiment's own checkpoints instead of re-applying the warm start.
+    if config.warm_start_checkpoint and not config.resume and not find_latest_checkpoint(config.output_dir):
+        log_for_0(f"Warm-starting from pretrained checkpoint: {config.warm_start_checkpoint}")
+        if config.use_staggered_time:
+            # Architecture change (new, zero-initialized per-position time params) means
+            # the pretrained checkpoint's param tree is structurally smaller than this
+            # run's. Restore it into an old-shaped template, then merge into the new
+            # (fresh-init) params — new params keep their fresh/zero init.
+            log_for_0("use_staggered_time=True: using merge-based warm-start (old checkpoint "
+                      "predates the per-position time params).")
+            old_model = model_fn(
+                text_encoder_dim=encoder_config.d_model, max_length=max_length,
+                attn_drop=config.attn_dropout, proj_drop=config.proj_dropout,
+                num_time_tokens=config.num_time_tokens,
+                num_self_cond_cfg_tokens=config.num_self_cond_cfg_tokens,
+                vocab_size=vocab_size,
+                num_model_mode_tokens=config.num_model_mode_tokens,
+                bottleneck_dim=config.bottleneck_dim,
+                use_position_time=False,
+            )
+            old_elf_params = old_model.init(init_rng, **init_args)
+            old_state = TrainState.create(
+                apply_fn=old_model.apply, params=old_elf_params["params"], tx=optimizer,
+                dropout_rng=dropout_rng, ema_params1=copy.deepcopy(old_elf_params["params"]),
+            )
+            pretrained_state, _ = load_checkpoint(config.warm_start_checkpoint, old_state)
+            merged_params, n_matched, n_new = merge_pretrained_params(pretrained_state.params, state.params)
+            merged_ema, _, _ = merge_pretrained_params(pretrained_state.ema_params1, state.ema_params1)
+            state = state.replace(params=merged_params, ema_params1=merged_ema)
+            log_for_0(f"Warm-start (merged): kept {n_matched} pretrained params, "
+                      f"{n_new} new param(s) start at fresh init.")
+        else:
+            pretrained_state, _ = load_checkpoint(config.warm_start_checkpoint, state)
+            state = state.replace(params=pretrained_state.params, ema_params1=pretrained_state.ema_params1)
+            log_for_0("Warm-start loaded params + ema_params1; optimizer state/step/epoch remain fresh.")
 
     # Auto-resume: if no explicit resume path, check output_dir for existing checkpoints
     if not config.resume:
@@ -326,6 +365,13 @@ def run_training(config):
     # Track last save point for fractional save_freq; use fractional epoch from
     # checkpoint to avoid re-saving immediately after resume.
     last_save_epoch = resume_epoch_fractional if resume_step > 0 else float(start_epoch)
+    # Fix D (bonus finding): eval_freq had no fractional/intra-epoch branch at all --
+    # only the end-of-epoch `eval_freq >= 1` check below existed, so every LM1B config
+    # in this project (which all use a fractional eval_freq like 0.021124, meaning
+    # "every ~10000 steps") silently NEVER triggered periodic in-training generation,
+    # since `current_epoch % eval_freq` with eval_freq < 1 never satisfies `>= 1`. Mirror
+    # save_freq's existing fractional handling so fractional eval_freq actually fires.
+    last_eval_epoch = resume_epoch_fractional if resume_step > 0 else float(start_epoch)
 
     for epoch in range(start_epoch, config.epochs):
         log_for_0(f"\nEpoch {epoch + 1}/{config.epochs}")
@@ -417,6 +463,19 @@ def run_training(config):
                     save_checkpoint(state, config.output_dir, global_step, hf_repo_id=config.hf_repo_id)
                     log_for_0(f"Saved checkpoint at epoch {progress:.2f} (step {global_step})")
                     last_save_epoch = progress
+
+            # Intra-epoch generation/eval (fractional eval_freq, e.g., 0.021124 epoch
+            # == "every ~10000 steps") -- mirrors save_freq's handling above; see the
+            # Fix D note at last_eval_epoch's initialization for why this is needed.
+            if 0 < config.eval_freq < 1:
+                progress = epoch + (global_step - epoch * steps_per_epoch) / steps_per_epoch
+                if progress - last_eval_epoch >= config.eval_freq:
+                    rng = run_generation(
+                        state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
+                        eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
+                        rng=rng, local_batch_size=local_batch_size,
+                    )
+                    last_eval_epoch = progress
 
         epoch_pbar.close()
         current_epoch = epoch + 1

@@ -8,6 +8,7 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import jax_utils
 from functools import partial
 from typing import Any, Dict
 from jax.random import PRNGKey
@@ -24,7 +25,7 @@ from utils.encoder_utils import encode_text
 from utils.generation_utils import (
     mask_after_eos, shift_left,
     _setup_generation, _make_pmap_pair, _shard_timesteps, _shard_noise,
-    _build_run_name,
+    _build_run_name, generate_block_cond, generate_block_uncond,
 )
 
 
@@ -41,7 +42,25 @@ def run_generation(
     rng: PRNGKey,
     local_batch_size: int,
 ) -> PRNGKey:
-    """Run test generation."""
+    """Run test generation.
+
+    Fix D: when `config.use_block_revelation` is set, dispatch to the actual
+    block-to-block (Algorithm 2) samplers (`generate_block_cond`/`generate_block_uncond`,
+    in `utils/generation_utils.py`) instead of the original one-shot full-sequence
+    sampler (`test_generation_cond`/`test_generation_uncond`, below). Previously this
+    function ALWAYS ran the full-sequence sampler regardless of `use_block_revelation`,
+    so this periodic in-training/eval.py generation measured the WRONG inference
+    algorithm for Stage-1 — the only correctly-routed entry points were the separate
+    manual scripts `eval_block.py`/`eval_block_uncond.py`. When
+    `use_block_revelation=False`, behavior here is unchanged.
+    """
+    if config.use_block_revelation:
+        return _run_block_generation(
+            state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_apply_fn,
+            eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
+            rng=rng, local_batch_size=local_batch_size,
+        )
+
     for sc_idx, sc in enumerate(config.sampling_configs):
         if len(config.sampling_configs) > 1:
             log_for_0(f"\n--- Sampling config {sc_idx + 1}/{len(config.sampling_configs)} ---")
@@ -64,6 +83,153 @@ def run_generation(
                 encoder_apply_fn=encoder_apply_fn,
                 dataset=eval_dataset,
             )
+
+    return rng
+
+
+def _run_block_generation(
+    state: Any,
+    encoder_params: Dict,
+    encoder_apply_fn,
+    eval_dataset,
+    tokenizer,
+    config,
+    rng: PRNGKey,
+    local_batch_size: int,
+) -> PRNGKey:
+    """Fix D block-sampler dispatch target.
+
+    Single-device, eager-loop generation via `generate_block_cond`/`generate_block_uncond`
+    — the same functions `eval_block.py`/`eval_block_uncond.py` already use correctly —
+    NOT pmapped/multi-device, unlike the full-sequence path this replaces when block mode
+    is on (`generate_block_cond`/`uncond`'s docstrings note this is intentional: a
+    smoke-test/qualitative-eval utility, not a production multi-device eval path; see
+    their module docstrings). Never passes reference target IDs/lengths into the
+    sampler. Writes output artifacts (`all_generated_*.jsonl`, `metrics.jsonl`)
+    comparable to the full-sequence path's, plus explicit run metadata
+    (generation_mode, block_size, sampling params, measured NFE, wall-clock latency).
+    """
+    state_unreplicated = jax_utils.unreplicate(state)
+    encoder_params_unreplicated = jax_utils.unreplicate(encoder_params)
+    epoch_val = int(state_unreplicated.epoch)
+    step_val = int(state_unreplicated.step)
+    pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
+
+    for sc_idx, sc in enumerate(config.sampling_configs):
+        if len(config.sampling_configs) > 1:
+            log_for_0(f"\n--- Sampling config {sc_idx + 1}/{len(config.sampling_configs)} ---")
+        rng, sample_rng = jax.random.split(rng)
+
+        # NFE instrumentation: count actual model forward calls. CFG/self-cond
+        # branches can call model_apply_fn more than once per sampling step (see
+        # utils/sampling_utils.py::_forward_sample[_self_cond]), so this MEASURES the
+        # true total per run rather than assuming a fixed per-step multiplier.
+        nfe_counter = {"n": 0}
+        base_apply_fn = state_unreplicated.apply_fn
+
+        def counting_apply_fn(*args, _base=base_apply_fn, _counter=nfe_counter, **kwargs):
+            _counter["n"] += 1
+            return _base(*args, **kwargs)
+
+        counting_state = state_unreplicated.replace(apply_fn=counting_apply_fn)
+
+        wall_start = time.time()
+        if eval_dataset is None:
+            hypotheses = generate_block_uncond(
+                state=counting_state, encoder_params=encoder_params_unreplicated,
+                encoder_apply_fn=encoder_apply_fn, tokenizer=tokenizer, config=config,
+                sampling_config=sc, batch_size=local_batch_size, rng=sample_rng,
+            )
+            references = None
+        else:
+            dataloader = get_dataloader(
+                eval_dataset, batch_size=local_batch_size, shuffle=False, num_workers=0,
+                drop_last=False, max_seq_length=config.max_length, pad_token_id=pad_token_id,
+                max_input_seq_length=config.max_input_length, distributed=False,
+            )
+            hypotheses, references = [], []
+            samples_done = 0
+            src_pos = jnp.arange(config.max_input_length)[None, :]
+            for batch in dataloader:
+                if samples_done >= config.num_samples:
+                    break
+                source_lengths = jnp.array(batch["cond_seq_mask"]).astype(jnp.int32).sum(axis=1)
+                # input_ids is packed TIGHT as [source][target][pad] (see
+                # data_utils.py's collate_fn); a naive fixed-width prefix would leak
+                # real target tokens into "source" whenever source is shorter than
+                # max_input_length, so mask anything past each row's real source
+                # length back to pad (matches the fix applied in eval_block.py).
+                source_ids = jnp.array(batch["input_ids"])[:, :config.max_input_length]
+                source_ids = jnp.where(src_pos < source_lengths[:, None], source_ids, pad_token_id)
+                rng, gen_rng = jax.random.split(rng)
+                batch_texts = generate_block_cond(
+                    state=counting_state, encoder_params=encoder_params_unreplicated,
+                    encoder_apply_fn=encoder_apply_fn, tokenizer=tokenizer, config=config,
+                    sampling_config=sc, source_ids=source_ids, source_lengths=source_lengths,
+                    rng=gen_rng,
+                )
+                hypotheses.extend(batch_texts)
+                references.extend(batch["target"])
+                samples_done += len(batch_texts)
+        wall_time = time.time() - wall_start
+
+        name = _build_run_name(
+            sc.sampling_method, sc.num_sampling_steps[0], sc.cfgs[0],
+            sc.self_cond_cfg_scales[0], sc.time_schedule, getattr(sc, "sde_gamma", 0.0),
+            suffix="block_uncond" if eval_dataset is None else "block_cond",
+        )
+        metadata = {
+            "generation_mode": "block",
+            "block_size": config.block_size,
+            "sampling_method": sc.sampling_method,
+            "flow_steps_per_round": sc.num_sampling_steps[0],
+            "measured_nfe_total": nfe_counter["n"],
+            "measured_nfe_per_sample": nfe_counter["n"] / max(1, len(hypotheses)),
+            "wall_clock_seconds": wall_time,
+            "checkpoint_step": step_val,
+        }
+        log_for_0(f"Block generation metadata: {metadata}")
+
+        if jax.process_index() == 0:
+            out_dir = os.path.join(config.output_dir, name)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"all_generated_{epoch_val}_{step_val}.jsonl")
+            with open(out_path, "w", encoding="utf-8") as f:
+                for i, gen in enumerate(hypotheses):
+                    f.write(json.dumps({"id": i, "generated": gen}, ensure_ascii=False) + "\n")
+            log_for_0(f"Saved {len(hypotheses)} generated texts to {out_path}")
+            upload_output_dir_to_hf(config.output_dir, config.hf_repo_id, reason="generation")
+
+            metrics_line = {"epoch": epoch_val, "step": step_val, **metadata}
+            if config.online_eval and hypotheses:
+                if references is not None:
+                    bleu_score = compute_bleu(hypotheses, references)
+                    rouge_scores = compute_rouge(hypotheses, references)
+                    metrics_line.update({"bleu": bleu_score, **rouge_scores})
+                    log_for_0(
+                        f"BLEU: {bleu_score:.2f}  ROUGE-1: {rouge_scores['rouge1']:.2f}  "
+                        f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}"
+                    )
+                else:
+                    nonempty = [s for s in hypotheses if isinstance(s, str) and s.strip()]
+                    if nonempty:
+                        ppl_metrics = PPLMetrics(
+                            gen_ppl_eval_model_name_or_path=config.eval_ppl_model,
+                            eval_ppl_batch_size=config.eval_ppl_batch_size,
+                            eval_context_size=config.eval_ppl_max_length,
+                        )
+                        ppl_results = ppl_metrics.record_generative_perplexity(
+                            text_samples=nonempty, max_length=config.eval_ppl_max_length, retokenize=True,
+                        )
+                        metrics_line.update({"ppl": ppl_results["ppl"], "mean_entropy": ppl_results["mean_entropy"]})
+                        log_for_0(
+                            f"Gen. PPL: {ppl_results['ppl']:.4f}  "
+                            f"Mean Entropy: {ppl_results['mean_entropy']:.4f}"
+                        )
+
+            with open(os.path.join(out_dir, "metrics.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(metrics_line, ensure_ascii=False) + "\n")
+            upload_output_dir_to_hf(config.output_dir, config.hf_repo_id, reason="generation metrics")
 
     return rng
 

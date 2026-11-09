@@ -6,10 +6,37 @@ from typing import Any, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from flax import serialization
+from flax import serialization, traverse_util
 from flax.training import checkpoints
 
 from utils.logging_utils import log_for_0
+
+
+def merge_pretrained_params(old_params: Any, fresh_params: Any) -> Tuple[Any, int, int]:
+    """Merge an old (smaller) param tree into a fresh (possibly larger) one.
+
+    For architecture changes that only *add* new param groups (e.g. a new zero-initialized
+    submodule) without changing any existing param's shape: every leaf present in both
+    trees is overwritten with the old value; leaves only present in `fresh_params` (the new
+    submodule) keep their fresh (e.g. zero) init. Returns (merged_params, n_matched,
+    n_new) for logging.
+    """
+    old_flat = traverse_util.flatten_dict(old_params)
+    fresh_flat = traverse_util.flatten_dict(fresh_params)
+    merged_flat = dict(fresh_flat)
+    n_matched = 0
+    for key, value in old_flat.items():
+        if key in merged_flat:
+            if merged_flat[key].shape != value.shape:
+                raise ValueError(f"Shape mismatch merging pretrained params at {key}: "
+                                  f"old={value.shape} vs fresh={merged_flat[key].shape}")
+            merged_flat[key] = value
+            n_matched += 1
+        else:
+            raise ValueError(f"Old param key {key} not found in fresh param tree; "
+                              f"architecture change must only add params, not remove/rename.")
+    n_new = len(fresh_flat) - n_matched
+    return traverse_util.unflatten_dict(merged_flat), n_matched, n_new
 
 
 def _local_path(path: str) -> str:

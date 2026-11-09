@@ -1,0 +1,101 @@
+# Phase 1b: block-to-block revelation + staggered per-position time — a faithful port
+# of SetDLM's StaggeredNoise schedule (see utils/block_utils.py:compute_staggered_timesteps
+# / _staggered_bk and modules/model.py's use_position_time), replacing an earlier,
+# abandoned discrete per-chunk offset scheme (free stagger_strength knob) after a parallel
+# effort porting the same trick to LM1B found that scheme caused severe training
+# instability there (93/100 samples collapsed into single-word repetition loops). The
+# closed-form schedule has no free intensity knob — (b, k) are derived deterministically
+# from block_size/max_length — and replaces (not layers on top of) the discrete
+# committed/active round split: every target position gets its own continuous effective
+# timestep in one pass. Warm-starts from our own block16 run's checkpoint_830002 (itself
+# warm-started from the pretrained ELF-B-de-en) via the merge-based loader in train.py,
+# since the new per-position time params don't exist in that checkpoint — see
+# utils.checkpoint_utils.merge_pretrained_params. New params start zero-initialized, so
+# this is a true continuation, not a regression (verified against the real checkpoint
+# before launch).
+
+# Dataset
+data_path: "embedded-language-flows/wmt14_de-en_train_t5"
+eval_data_path: "embedded-language-flows/wmt14_de-en_validation_t5"
+max_length: 128
+max_input_length: 64
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
+use_block_revelation: true
+block_size: 16
+
+# Staggered per-position time (new scheme — see top-of-file note). No free intensity
+# knob: (b, k) are derived deterministically from block_size/max_length/max_input_length.
+use_staggered_time: true
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 1.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+label_drop_prob: 0.1
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — scaled for 2x A40, ~27GB/GPU target
+epochs: 20
+global_batch_size: 96  # bumped from 64 — both GPUs free (no other users), using more headroom
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 500
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/cond_sampling_configs.yml"
+num_samples: 64
+
+# Logging & Checkpointing
+# save_freq is a fraction-of-epoch; steps_per_epoch = 4508785 // 96 = 46966, so
+# 2000 / 46966 ≈ 0.042586 saves a checkpoint roughly every 2000 steps.
+log_freq: 10
+save_freq: 0.042586
+eval_freq: 5
+
+# Output — new experiment lineage (different architecture, new output dir so
+# auto-resume doesn't try to restore old-shaped checkpoints via the non-merge path)
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16-staggered"
+hf_repo_id: null
+resume: null
+# Warm-start from our own (non-staggered) block16 run, not the raw pretrained checkpoint
+# — it's already adapted to the block-revelation task. train.py detects
+# use_staggered_time=True and uses the merge-based loader automatically.
+warm_start_checkpoint: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16"
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-wmt-de-en-block16-staggered
+
+# Misc
+seed: 42
