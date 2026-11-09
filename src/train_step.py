@@ -104,6 +104,16 @@ def train_step(
             # fresh re-encoding of only-ever-committed context can never replicate.
             role_clean_mask = clean_mask[:, :, 0]
 
+    # Only pass a real (padding-excluding) attention_mask to the ELF denoiser's own
+    # self-attention when role_clean_mask is also active -- the model combines the two
+    # into one role+validity mask (see modules/model.py). Without this, "active query
+    # attends to everything" would include PADDING keys as if they were valid content
+    # (a real gap found in the original version of this fix, missed because its own
+    # regression test used an all-valid, no-padding batch). Every other path
+    # (non-block, staggered-noise) keeps attention_mask=None, i.e. fully unmasked
+    # self-attention, matching every checkpoint already trained that way.
+    denoiser_attention_mask = attention_mask if role_clean_mask is not None else None
+
     # Label drop before encoding: prevent target tokens from attending to
     # condition tokens so x0 is truly unconditional for dropped samples.
     if config.label_drop_prob > 0:
@@ -192,6 +202,7 @@ def train_step(
         z_with_zeros = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_init = state.apply_fn(
             {"params": params}, z_with_zeros, t,
+            attention_mask=denoiser_attention_mask,
             deterministic=True,
             self_cond_cfg_scale=self_cond_cfg_input,
             t_pos=t_pos,
@@ -211,6 +222,7 @@ def train_step(
 
     def get_sc_cond_and_uncond(params, z, t_phys_in, cond_mask, x_tokens):
         kwargs = {
+            "attention_mask": denoiser_attention_mask,
             "self_cond_cfg_scale": self_cond_cfg_scale,
             "deterministic": True,
             "t_pos": t_pos,
@@ -283,6 +295,7 @@ def train_step(
             )
             net_out, _ = state.apply_fn(
                 {"params": params}, denoiser_input, t,
+                attention_mask=denoiser_attention_mask,
                 deterministic=False,
                 rngs={"dropout": model_dropout_rng},
                 self_cond_cfg_scale=self_cond_cfg_scale,

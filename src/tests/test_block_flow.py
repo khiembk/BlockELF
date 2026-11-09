@@ -494,6 +494,106 @@ def test_fix_c_no_active_leak_into_clean_hidden_states():
           f"across all {model.depth} transformer layers")
 
 
+def test_fix_c_padding_excluded_from_attention_keys():
+    """Fix C refinement regression test: when `role_clean_mask` is used alongside a
+    real (padding-excluding) `attention_mask`, every query -- clean AND active -- must
+    exclude PADDING positions as attention keys. The original version of this fix only
+    ever tested an all-valid (no-padding) batch, so it never caught that the "active
+    query attends to everything" branch included padding keys as if they were valid
+    content (confirmed: this only showed up as a real problem on WMT14, which has
+    substantial variable-length padding, unlike that test's synthetic batch).
+    """
+    vocab_size, d_model, seq_len = 37, 8, 16
+    batch_size = 2
+    model = ELF(
+        text_encoder_dim=d_model, max_length=seq_len, hidden_size=16, depth=3, num_heads=2,
+        bottleneck_dim=4, num_time_tokens=2, num_self_cond_cfg_tokens=2,
+        num_model_mode_tokens=2, vocab_size=vocab_size,
+    )
+    rng = jax.random.PRNGKey(1)
+    rng, init_rng = jax.random.split(rng)
+    t = jnp.full((batch_size,), 0.5)
+    self_cond_cfg_scale = jnp.ones((batch_size,))
+    dummy_x = jnp.ones((batch_size, seq_len, d_model))
+    dummy_clean = jnp.ones((batch_size, seq_len), dtype=bool)
+    dummy_valid = jnp.ones((batch_size, seq_len))
+    params = model.init(
+        init_rng, x=dummy_x, t=t, deterministic=True, self_cond_cfg_scale=self_cond_cfg_scale,
+        decoder_step_active=jnp.array(True), role_clean_mask=dummy_clean,
+        attention_mask=dummy_valid,
+    )["params"]
+
+    # cond_len=4, committed_len=4, real (valid) target content up to index 11, then
+    # padding from index 11 to seq_len-1.
+    cond_len, committed_len, valid_len = 4, 4, 12
+    pos = np.arange(seq_len)
+    is_clean_content = pos < (cond_len + committed_len)
+    is_valid_content = pos < valid_len
+    role_clean_mask = jnp.array(np.tile(is_clean_content, (batch_size, 1)))
+    attention_mask = jnp.array(np.tile(is_valid_content, (batch_size, 1)).astype(np.float32))
+
+    num_special = model.num_model_mode_tokens + model.num_time_tokens + model.num_self_cond_cfg_tokens
+    is_valid_full = np.concatenate([np.ones(num_special, dtype=bool), is_valid_content])
+    valid_idx = np.where(is_valid_full)[0]
+
+    rng, a_rng, b_rng = jax.random.split(rng, 3)
+    base_x = jax.random.normal(a_rng, (batch_size, seq_len, d_model))
+    pad_fill_a = jax.random.normal(a_rng, (batch_size, seq_len, d_model))
+    pad_fill_b = jax.random.normal(b_rng, (batch_size, seq_len, d_model))
+    is_valid_content_b = jnp.array(np.tile(is_valid_content, (batch_size, 1)))[:, :, None]
+    x_a = jnp.where(is_valid_content_b, base_x, pad_fill_a)
+    x_b = jnp.where(is_valid_content_b, base_x, pad_fill_b)
+    assert not jnp.allclose(x_a, x_b), "test setup bug: padding region identical"
+
+    def run(x, with_attention_mask):
+        _, mutated = model.apply(
+            {"params": params}, x, t, deterministic=True,
+            attention_mask=attention_mask if with_attention_mask else None,
+            self_cond_cfg_scale=self_cond_cfg_scale, decoder_step_active=jnp.array(True),
+            role_clean_mask=role_clean_mask,
+            capture_intermediates=lambda mdl, method_name: isinstance(mdl, ELFBlock),
+            mutable=["intermediates"],
+        )
+        return mutated["intermediates"]
+
+    # With attention_mask passed (the fix): every valid position (clean or active)
+    # must be invariant to padding-region content.
+    inter_a = run(x_a, with_attention_mask=True)
+    inter_b = run(x_b, with_attention_mask=True)
+    for block_name in inter_a:
+        out_a = np.array(inter_a[block_name]["__call__"][0])
+        out_b = np.array(inter_b[block_name]["__call__"][0])
+        valid_a, valid_b = out_a[:, valid_idx], out_b[:, valid_idx]
+        assert np.allclose(valid_a, valid_b, atol=1e-4), (
+            f"Fix C regression: valid-position hidden states at {block_name} changed "
+            f"when only padding-region input changed (attention_mask not excluding "
+            f"padding keys)"
+        )
+    print("[OK] Fix C: padding positions excluded as attention keys for every query "
+          "when attention_mask is passed alongside role_clean_mask")
+
+    # Sensitivity check: WITHOUT attention_mask (the original, incomplete version of
+    # this fix), active queries should actually be affected by padding-region content,
+    # confirming this test would have failed against that version.
+    inter_a_nomask = run(x_a, with_attention_mask=False)
+    inter_b_nomask = run(x_b, with_attention_mask=False)
+    is_active_full = ~np.concatenate([np.ones(num_special, dtype=bool), is_clean_content])
+    active_only_idx = np.where(is_active_full & is_valid_full)[0]
+    leaked = False
+    for block_name in inter_a_nomask:
+        out_a = np.array(inter_a_nomask[block_name]["__call__"][0])
+        out_b = np.array(inter_b_nomask[block_name]["__call__"][0])
+        if not np.allclose(out_a[:, active_only_idx], out_b[:, active_only_idx], atol=1e-5):
+            leaked = True
+            break
+    assert leaked, (
+        "test setup bug: expected padding-region content to leak into active-query "
+        "outputs when attention_mask is omitted (sensitivity check failed)"
+    )
+    print("[OK] Fix C: confirmed sensitive -- without attention_mask, padding does leak "
+          "into active-query outputs (i.e. this test would have caught the original gap)")
+
+
 def test_staggered_timesteps_schedule_shape():
     """Sanity-check the SetDLM-ported (b, k) derivation and the resulting per-position
     schedule, independent of the full train_step machinery.
@@ -662,6 +762,7 @@ if __name__ == "__main__":
     test_fix_a_no_future_leak_into_committed_encoding()
     test_fix_b_tight_packing_and_target_relative_extraction()
     test_fix_c_no_active_leak_into_clean_hidden_states()
+    test_fix_c_padding_excluded_from_attention_keys()
     test_staggered_timesteps_schedule_shape()
     test_staggered_noise_finite_loss_and_trains_pos_embedder()
     test_round_count_reweighting_fixes_bias()

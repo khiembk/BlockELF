@@ -149,14 +149,26 @@ class ELF(nn.Module):
         if role_clean_mask is not None:
             # Fix C: build the full (B, S_total, S_total) role-based query/key mask,
             # covering the prepended special tokens too (treated as "clean" queries,
-            # but visible as keys to every query -- see docstring). Overrides whatever
-            # the generic `attention_mask is not None` extension above would have done,
-            # since that logic only ever chains a simple 1-D validity mask, not a role.
+            # but visible as keys to every query -- see docstring).
+            #
+            # Combined (via AND/multiply) with `attention_mask`'s padding-validity
+            # exclusion, already extended with the prefix/mode-token 1s above by the
+            # generic `attention_mask is not None` blocks earlier. Without this, the
+            # "active query attends to everything" branch below would include PADDING
+            # keys as if they were valid content -- a real gap in the original version
+            # of this fix (missed because its own regression test used an all-valid,
+            # no-padding batch, so it never exercised this path): the ELF denoiser
+            # previously received no attention mask at all outside this path (fully
+            # unmasked, including padding), so if the caller wants padding excluded
+            # here, it must pass the real validity mask in via `attention_mask` too.
             is_clean_special = jnp.ones((B, model_mode_offset + prefix_len), dtype=bool)
             is_clean_full = jnp.concatenate([is_clean_special, role_clean_mask.astype(bool)], axis=1)
             is_clean_q = is_clean_full[:, :, None]
             is_clean_k = is_clean_full[:, None, :]
-            attention_mask = jnp.where(is_clean_q, is_clean_k, jnp.ones_like(is_clean_k)).astype(x.dtype)
+            role_mask = jnp.where(is_clean_q, is_clean_k, jnp.ones_like(is_clean_k)).astype(jnp.float32)
+            if attention_mask is not None:
+                role_mask = role_mask * attention_mask[:, None, :]
+            attention_mask = role_mask.astype(x.dtype)
 
         feat_rope = TextRotaryEmbeddingFast(
             dim=head_dim, pt_seq_len=self.max_length,
