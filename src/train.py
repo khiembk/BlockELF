@@ -330,6 +330,13 @@ def run_training(config):
     # Track last save point for fractional save_freq; use fractional epoch from
     # checkpoint to avoid re-saving immediately after resume.
     last_save_epoch = resume_epoch_fractional if resume_step > 0 else float(start_epoch)
+    # Fix D (bonus finding): eval_freq had no fractional/intra-epoch branch at all --
+    # only the end-of-epoch `eval_freq >= 1` check below existed, so every LM1B config
+    # in this project (which all use a fractional eval_freq like 0.021124, meaning
+    # "every ~10000 steps") silently NEVER triggered periodic in-training generation,
+    # since `current_epoch % eval_freq` with eval_freq < 1 never satisfies `>= 1`. Mirror
+    # save_freq's existing fractional handling so fractional eval_freq actually fires.
+    last_eval_epoch = resume_epoch_fractional if resume_step > 0 else float(start_epoch)
 
     for epoch in range(start_epoch, config.epochs):
         log_for_0(f"\nEpoch {epoch + 1}/{config.epochs}")
@@ -421,6 +428,19 @@ def run_training(config):
                     save_checkpoint(state, config.output_dir, global_step, hf_repo_id=config.hf_repo_id)
                     log_for_0(f"Saved checkpoint at epoch {progress:.2f} (step {global_step})")
                     last_save_epoch = progress
+
+            # Intra-epoch generation/eval (fractional eval_freq, e.g., 0.021124 epoch
+            # == "every ~10000 steps") -- mirrors save_freq's handling above; see the
+            # Fix D note at last_eval_epoch's initialization for why this is needed.
+            if 0 < config.eval_freq < 1:
+                progress = epoch + (global_step - epoch * steps_per_epoch) / steps_per_epoch
+                if progress - last_eval_epoch >= config.eval_freq:
+                    rng = run_generation(
+                        state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
+                        eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
+                        rng=rng, local_batch_size=local_batch_size,
+                    )
+                    last_eval_epoch = progress
 
         epoch_pbar.close()
         current_epoch = epoch + 1

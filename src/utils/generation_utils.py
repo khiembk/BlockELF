@@ -215,6 +215,46 @@ def _shard_noise(device_rngs, num_local_devices, per_device, max_length, d_model
 # ============================================
 # Block-to-block (fixed-commitment) inference — Adaptive BlockFlow Stage 1, Alg. 2
 # ============================================
+def pack_source_target_tight(source_ids, committed_target_ids, source_lengths, max_input_length, max_length):
+    """Pack `[actual source tokens][committed target tokens][trailing pad]` with NO gap
+    between source and target, matching training's `collate_fn` (cond_len varies per
+    example, tight-packed against target) -- see Fix A/B history in
+    `generate_block_cond`'s docstring. `source_ids` is (B, max_input_length)
+    (pad-token-filled beyond each row's `source_lengths[i]`); `committed_target_ids` is
+    (B, storage_width) with storage_width a static upper bound (caller's choice, e.g.
+    `max_length`). Returns `(full_ids, is_source_full, is_committed_full)`, each
+    `(B, max_length)` — `is_committed_full` marks positions < `source_lengths[i] +
+    committed_len[i]` implicitly via `committed_target_ids`'s own padding, i.e. the
+    caller is still responsible for its own role masks from `committed_len`; this
+    function only handles the tight *positional* packing.
+    """
+    batch_size = source_ids.shape[0]
+    pos_full = jnp.arange(max_length)[None, :]
+    is_source_full = pos_full < source_lengths[:, None]
+    wide = jnp.concatenate([source_ids, committed_target_ids], axis=1)
+    gather_idx = jnp.where(
+        is_source_full, pos_full, pos_full + (max_input_length - source_lengths[:, None]),
+    )
+    gather_idx = jnp.clip(gather_idx, 0, wide.shape[1] - 1)
+    full_ids = jnp.take_along_axis(wide, gather_idx, axis=1)
+    return full_ids, is_source_full
+
+
+def extract_target_relative(full_tensor, source_lengths, storage_width, max_length):
+    """Inverse of `pack_source_target_tight`'s positional packing: extract the
+    target-relative region starting at each row's own `source_lengths[i]` (not a fixed
+    offset), from a `(B, max_length, ...)` tensor (ids or embeddings). Returns
+    `(B, storage_width, ...)`.
+    """
+    pos_store = jnp.arange(storage_width)[None, :]
+    gather_idx = jnp.clip(pos_store + source_lengths[:, None], 0, max_length - 1)
+    if full_tensor.ndim == 2:
+        return jnp.take_along_axis(full_tensor, gather_idx, axis=1)
+    extra = (1,) * (full_tensor.ndim - 2)
+    gather_idx = gather_idx.reshape(gather_idx.shape + extra)
+    return jnp.take_along_axis(full_tensor, jnp.broadcast_to(gather_idx, gather_idx.shape[:2] + full_tensor.shape[2:]), axis=1)
+
+
 def generate_block_cond(
     state: Any,
     encoder_params: Dict,
@@ -251,7 +291,6 @@ def generate_block_cond(
     block_size = config.block_size
     max_input_length = config.max_input_length
     max_length = config.max_length
-    canvas_length = max_length - max_input_length
 
     model_params = state.ema_params1 if use_ema else state.params
     model_apply_fn = state.apply_fn
@@ -259,22 +298,40 @@ def generate_block_cond(
     self_cond_cfg_scale = sampling_config.self_cond_cfg_scales[0]
 
     batch_size = source_ids.shape[0]
-    pos_full = jnp.arange(max_length)[None, :]
-    pos_tgt = jnp.arange(canvas_length)[None, :]
+    pos_full = jnp.arange(max_length)[None, :]      # absolute position in the packed canvas
+    storage_width = max_length                      # static upper bound on target_capacity (source_lengths>=0)
+    pos_store = jnp.arange(storage_width)[None, :]   # target-relative position within storage
     is_source_full = pos_full < source_lengths[:, None]
 
-    committed_target_ids = jnp.full((batch_size, canvas_length), pad_token_id, dtype=jnp.int32)
+    # Fix B: target canvas CAPACITY is reconciled with each example's actual source
+    # length (max_length - source_lengths[i]), not a fixed worst-case budget
+    # (max_length - max_input_length) -- a shorter source affords strictly more real
+    # target room, matching training's tight packing (see below), not less.
+    target_capacity = max_length - source_lengths  # (B,), each in [max_length-max_input_length, max_length]
+
+    committed_target_ids = jnp.full((batch_size, storage_width), pad_token_id, dtype=jnp.int32)
     committed_len = jnp.zeros((batch_size,), dtype=jnp.int32)
     finished = jnp.zeros((batch_size,), dtype=bool)
 
-    max_rounds = (canvas_length + block_size - 1) // block_size
+    max_rounds = (storage_width + block_size - 1) // block_size
     for _ in range(max_rounds):
-        if bool(jnp.all(finished | (committed_len >= canvas_length))):
+        if bool(jnp.all(finished | (committed_len >= target_capacity))):
             break
 
-        full_ids = jnp.concatenate([source_ids, committed_target_ids], axis=1)
-        is_committed_full = (pos_full >= max_input_length) & (
-            pos_full < (max_input_length + committed_len)[:, None]
+        # Fix B: pack [actual source][committed target][trailing pad] with NO gap,
+        # matching training's collate_fn (cond_len varies per example, tight-packed
+        # against target). The previous version concatenated a FIXED-width
+        # (max_input_length-padded) source with the target canvas, so target position 0
+        # always sat at the fixed absolute index `max_input_length` regardless of the
+        # real source length -- a different (usually larger) source->target relative
+        # RoPE distance than any source of that length saw in training, plus an
+        # unmasked mid-sequence padding gap that training never has.
+        full_ids, _ = pack_source_target_tight(
+            source_ids, committed_target_ids, source_lengths, max_input_length, max_length,
+        )
+
+        is_committed_full = (pos_full >= source_lengths[:, None]) & (
+            pos_full < (source_lengths + committed_len)[:, None]
         )
         is_valid_full = is_source_full | is_committed_full
         encoder_attn, _, clean_mask = build_committed_context(
@@ -305,27 +362,31 @@ def generate_block_cond(
             z=z_final, model_params=model_params, model_apply_fn=model_apply_fn,
             t_final_val=t_steps[-1], config=config, self_cond_cfg_scale=self_cond_cfg_scale,
         )
-        predicted_target_ids = predicted_ids[:, max_input_length:]
+        # Target-relative extraction: row i's target starts right after its own real
+        # source length (not the fixed max_input_length), inverse of the packing above.
+        predicted_target_ids = extract_target_relative(
+            predicted_ids, source_lengths, storage_width, max_length,
+        )
 
         # Commit the next `block_size` tokens of the active region (left-to-right).
-        commit_upto = jnp.minimum(committed_len + block_size, canvas_length)
-        newly_committed = (pos_tgt >= committed_len[:, None]) & (pos_tgt < commit_upto[:, None])
+        commit_upto = jnp.minimum(committed_len + block_size, target_capacity)
+        newly_committed = (pos_store >= committed_len[:, None]) & (pos_store < commit_upto[:, None])
         committed_target_ids = jnp.where(newly_committed, predicted_target_ids, committed_target_ids)
 
         # EOS can only end generation at its own position once everything before it is
         # committed (Sec. 5); since we always commit left-to-right contiguously, the
         # first EOS among the committed-so-far tokens is exactly that position. Restrict
-        # the check to positions actually committed by this round (`pos_tgt < commit_upto`)
+        # the check to positions actually committed by this round (`pos_store < commit_upto`)
         # — with pad_token: eos, pad_token_id == eos_token_id, so the not-yet-committed
         # filler tail would otherwise spuriously register as an EOS hit.
-        is_eos = (committed_target_ids == eos_token_id) & (pos_tgt < commit_upto[:, None])
+        is_eos = (committed_target_ids == eos_token_id) & (pos_store < commit_upto[:, None])
         has_eos = jnp.any(is_eos, axis=1)
         first_eos_pos = jnp.argmax(is_eos, axis=1)
         committed_len = jnp.where(finished, committed_len, commit_upto)
         committed_len = jnp.where((~finished) & has_eos, first_eos_pos + 1, committed_len)
-        finished = finished | has_eos
+        finished = finished | has_eos | (committed_len >= target_capacity)
         committed_target_ids = jnp.where(
-            pos_tgt < committed_len[:, None], committed_target_ids, pad_token_id,
+            pos_store < committed_len[:, None], committed_target_ids, pad_token_id,
         )
 
     texts = []

@@ -29,11 +29,14 @@ from datasets import Dataset
 from flax import jax_utils
 from flax.training.common_utils import shard
 
-from utils.block_utils import sample_block_round, compute_staggered_timesteps, _staggered_bk
+from utils.block_utils import (
+    sample_block_round, compute_staggered_timesteps, _staggered_bk, build_committed_context,
+)
 from utils.data_utils import compute_block_round_counts
-from utils.encoder_utils import build_self_attn_cond_masks
+from utils.encoder_utils import build_self_attn_cond_masks, encode_text
+from utils.generation_utils import pack_source_target_tight, extract_target_relative
 from utils.train_utils import TrainState, create_learning_rate_fn
-from modules.model import ELF
+from modules.model import ELF, ELFBlock
 from train_step import train_step
 
 
@@ -90,6 +93,31 @@ def _make_dummy_encoder(vocab_size, d_model):
             return nn.Embed(vocab_size, d_model)(input_ids)
 
     return DummyEncoder()
+
+
+def _make_attentive_dummy_encoder(vocab_size, d_model):
+    """A tiny single-layer self-attention 'encoder' that actually MIXES information
+    across positions via `attention_mask` (unlike `_make_dummy_encoder`, a pure
+    per-token embedding lookup that ignores `attention_mask` entirely and so can never
+    expose a masking bug). Needed to test Fix A: whether varying token IDs at
+    mask-disallowed positions changes the hidden state at other positions."""
+
+    class AttentiveDummyEncoder(nn.Module):
+        @nn.compact
+        def __call__(self, input_ids, attention_mask, deterministic=True):
+            del deterministic
+            x = nn.Embed(vocab_size, d_model)(input_ids)
+            q = nn.Dense(d_model, name="q")(x)
+            k = nn.Dense(d_model, name="k")(x)
+            v = nn.Dense(d_model, name="v")(x)
+            scores = jnp.einsum("bqd,bkd->bqk", q, k) / jnp.sqrt(d_model)
+            # attention_mask here is always the 3-D (B, Q, K) role mask this test
+            # constructs via build_committed_context/build_self_attn_cond_masks.
+            bias = jnp.where(attention_mask > 0, 0.0, -1e9)
+            attn = jax.nn.softmax(scores + bias, axis=-1)
+            return jnp.einsum("bqk,bkd->bqd", attn, v)
+
+    return AttentiveDummyEncoder()
 
 
 def _make_batch(rng, batch_size, seq_len, cond_len, vocab_size):
@@ -228,6 +256,242 @@ def test_train_step_block_mode_finite_loss():
         f"non-block active_frac ({np.mean(base_fracs):.3f})"
     )
     print(f"[OK] mean active_frac block={np.mean(block_fracs):.3f} vs non-block={np.mean(base_fracs):.3f}")
+
+
+def test_fix_a_no_future_leak_into_committed_encoding():
+    """Fix A regression test: the frozen T5 encoder's committed-prefix embeddings must
+    never depend on token IDs at as-yet-unrevealed ("active") target positions.
+
+    Before the fix, `train_step.py` called `encode_text` with the *default*
+    cond-sees-cond/target-sees-all mask BEFORE `sample_block_round` even ran, so
+    "committed" positions' embeddings were contextualized with bidirectional access to
+    the entire (including active) target region -- something inference's
+    `build_committed_context` (re-encoding only actually-generated tokens each round)
+    can never replicate. The fix: sample the committed/active split first and build the
+    encoder mask via `build_committed_context` (clean queries see only clean keys).
+
+    Uses `_make_attentive_dummy_encoder` (real masked self-attention, unlike the
+    per-token-only `_make_dummy_encoder` used elsewhere) so this test can actually
+    distinguish "masking respected" from "masking ignored."
+    """
+    vocab_size, d_model, seq_len = 37, 8, 20
+    rng = jax.random.PRNGKey(0)
+    rng, enc_rng = jax.random.split(rng)
+    encoder = _make_attentive_dummy_encoder(vocab_size, d_model)
+    encoder_params = encoder.init(
+        enc_rng, input_ids=jnp.zeros((1, seq_len), dtype=jnp.int32),
+        attention_mask=jnp.ones((1, seq_len, seq_len)),
+    )["params"]
+
+    def encode(input_ids, is_source, is_committed_target, is_valid):
+        encoder_attention_mask, _, _ = build_committed_context(
+            is_source, is_committed_target, is_valid, xp=jnp,
+        )
+        return encode_text(
+            input_ids=input_ids, attention_mask=encoder_attention_mask,
+            encoder_apply_fn=encoder.apply, encoder_params=encoder_params,
+            latent_mean=0.0, latent_std=1.0,
+        )
+
+    pos = np.arange(seq_len)
+    is_valid = jnp.ones((1, seq_len), dtype=bool)
+
+    # (cond_len, committed_len) cases: LM1B-like (cond_len=0) and WMT14-like
+    # (cond_len>0); committed_len=0 ("k=0"), middle, and near-last round.
+    cases = [
+        (0, 0), (0, 4), (0, 16),      # LM1B-like: no source at all
+        (6, 0), (6, 4), (6, 10),      # WMT14-like: source + committed
+    ]
+    for cond_len, committed_len in cases:
+        assert cond_len + committed_len <= seq_len
+        is_source = jnp.array(pos < cond_len)[None, :]
+        is_committed_target = jnp.array(
+            (pos >= cond_len) & (pos < cond_len + committed_len)
+        )[None, :]
+        is_clean_np = np.array(is_source[0]) | np.array(is_committed_target[0])
+
+        rng, ids_rng, active_a_rng, active_b_rng = jax.random.split(rng, 4)
+        base_ids = jax.random.randint(ids_rng, (1, seq_len), 0, vocab_size)
+
+        # Two fillings that agree everywhere EXCEPT the active (uncommitted target)
+        # region -- clean positions' resulting embeddings must be identical.
+        active_fill_a = jax.random.randint(active_a_rng, (1, seq_len), 0, vocab_size)
+        active_fill_b = jax.random.randint(active_b_rng, (1, seq_len), 0, vocab_size)
+        is_clean_jnp = jnp.array(is_clean_np)[None, :]
+        ids_a = jnp.where(is_clean_jnp, base_ids, active_fill_a)
+        ids_b = jnp.where(is_clean_jnp, base_ids, active_fill_b)
+        assert not jnp.all(ids_a == ids_b), "test setup bug: active region identical"
+
+        emb_a = encode(ids_a, is_source, is_committed_target, is_valid)
+        emb_b = encode(ids_b, is_source, is_committed_target, is_valid)
+
+        clean_idx = np.where(is_clean_np)[0]
+        active_idx = np.where(~is_clean_np)[0]
+        if len(clean_idx) > 0:
+            clean_a = np.array(emb_a[0, clean_idx])
+            clean_b = np.array(emb_b[0, clean_idx])
+            assert np.allclose(clean_a, clean_b, atol=1e-5), (
+                f"Fix A regression: clean (source+committed) embeddings changed when "
+                f"only active-region token IDs changed (cond_len={cond_len}, "
+                f"committed_len={committed_len})"
+            )
+        if len(active_idx) > 0:
+            # Sanity check the encoder is actually sensitive to its input at all here
+            # (rules out a trivially-passing test from an encoder/mask that ignores
+            # everything), by requiring at least one active position to visibly differ.
+            active_a = np.array(emb_a[0, active_idx])
+            active_b = np.array(emb_b[0, active_idx])
+            assert not np.allclose(active_a, active_b, atol=1e-5), (
+                f"test setup bug: active embeddings identical despite differing input "
+                f"IDs (cond_len={cond_len}, committed_len={committed_len})"
+            )
+    print("[OK] Fix A: committed/source embeddings invariant to active-region token IDs "
+          "across k=0/middle/near-last rounds, LM1B- and WMT14-like cond_len")
+
+
+def test_fix_b_tight_packing_and_target_relative_extraction():
+    """Fix B regression test: `generate_block_cond`'s packing must match training's
+    tight `[source][target][pad]` layout (no gap), with target position 0 at each
+    row's own `source_lengths[i]` (not a fixed `max_input_length` offset), for
+    variable source lengths including LM1B-like `source_length=0`.
+    """
+    max_input_length, max_length = 10, 20
+    pad_id = 99
+    batch_size = 3
+    source_lengths = jnp.array([0, 3, 10])  # zero (LM1B-like), short, and full-length
+
+    # source_ids: real content 1..source_len, padded with pad_id to max_input_length.
+    pos_src = np.arange(max_input_length)[None, :]
+    source_lengths_np = np.array(source_lengths)
+    source_ids = np.where(
+        pos_src < source_lengths_np[:, None], pos_src + 1, pad_id,
+    ).astype(np.int32)
+    source_ids = jnp.array(source_ids)
+
+    # committed_target_ids: real content 100..100+storage_width-1 (so they're
+    # trivially distinguishable from source content and from pad_id), storage_width
+    # = max_length for this test (matches generate_block_cond's own choice).
+    storage_width = max_length
+    committed_target_ids = jnp.array(
+        np.tile(np.arange(100, 100 + storage_width), (batch_size, 1)).astype(np.int32)
+    )
+
+    full_ids, is_source_full = pack_source_target_tight(
+        source_ids, committed_target_ids, source_lengths, max_input_length, max_length,
+    )
+    full_ids_np = np.array(full_ids)
+    is_source_full_np = np.array(is_source_full)
+
+    for i in range(batch_size):
+        s_len = source_lengths_np[i]
+        # No gap: positions [0, s_len) are real source content (1..s_len).
+        assert list(full_ids_np[i, :s_len]) == list(range(1, s_len + 1)), (
+            f"row {i}: source content not tight-packed at the front"
+        )
+        # Target position 0 sits EXACTLY at absolute index s_len (not max_input_length
+        # unless s_len == max_input_length) -- no unmasked padding gap in between.
+        assert full_ids_np[i, s_len] == 100, (
+            f"row {i}: target position 0 not at absolute index {s_len} "
+            f"(got {full_ids_np[i, s_len]} -- possible stale fixed-offset gap)"
+        )
+        # The rest of the canvas up to max_length is target content, contiguous.
+        remaining = max_length - s_len
+        assert list(full_ids_np[i, s_len:max_length]) == list(range(100, 100 + remaining)), (
+            f"row {i}: target region not contiguous after source"
+        )
+        assert is_source_full_np[i, :s_len].all() and not is_source_full_np[i, s_len:].any()
+
+    # Inverse extraction: predicted (full_ids itself, reused as a stand-in "prediction")
+    # target-relative slice must recover exactly committed_target_ids's first
+    # (max_length - source_lengths[i]) entries for every row, regardless of source_len.
+    extracted = extract_target_relative(full_ids, source_lengths, storage_width, max_length)
+    extracted_np = np.array(extracted)
+    for i in range(batch_size):
+        s_len = source_lengths_np[i]
+        remaining = max_length - s_len
+        assert list(extracted_np[i, :remaining]) == list(range(100, 100 + remaining)), (
+            f"row {i}: target-relative extraction did not invert the tight packing"
+        )
+    print("[OK] Fix B: tight source/target packing + target-relative extraction, "
+          "variable source lengths incl. LM1B-like source_length=0")
+
+
+def test_fix_c_no_active_leak_into_clean_hidden_states():
+    """Fix C regression test: under block-revelation's role-based attention mask
+    (`role_clean_mask`, modules/model.py), clean (source+committed) query hidden
+    states must stay invariant to what's happening at active (noisy) positions, at
+    EVERY transformer layer depth -- including through the prepended special tokens
+    (time/self-cond-cfg/model-mode tokens), which must not become an indirect leak
+    path (active -> special token -> clean). Uses `capture_intermediates` to inspect
+    every `ELFBlock`'s raw output directly, sidestepping `FinalLayer`'s zero-initialized
+    kernel (which would otherwise make the model's final output trivially all-zero
+    regardless of input, masking a real invariance failure as a false pass).
+    """
+    vocab_size, d_model, seq_len = 37, 8, 16
+    batch_size = 2
+    model = ELF(
+        text_encoder_dim=d_model, max_length=seq_len, hidden_size=16, depth=3, num_heads=2,
+        bottleneck_dim=4, num_time_tokens=2, num_self_cond_cfg_tokens=2,
+        num_model_mode_tokens=2, vocab_size=vocab_size,
+    )
+    rng = jax.random.PRNGKey(0)
+    rng, init_rng = jax.random.split(rng)
+    t = jnp.full((batch_size,), 0.5)
+    self_cond_cfg_scale = jnp.ones((batch_size,))
+    dummy_x = jnp.ones((batch_size, seq_len, d_model))
+    dummy_clean = jnp.ones((batch_size, seq_len), dtype=bool)
+    params = model.init(
+        init_rng, x=dummy_x, t=t, deterministic=True, self_cond_cfg_scale=self_cond_cfg_scale,
+        decoder_step_active=jnp.array(True), role_clean_mask=dummy_clean,
+    )["params"]
+
+    cond_len, committed_len = 4, 4
+    pos = np.arange(seq_len)
+    is_clean_content = pos < (cond_len + committed_len)
+    role_clean_mask = jnp.array(np.tile(is_clean_content, (batch_size, 1)))
+    # Special tokens (model-mode, time, self-cond-cfg) are prepended in that order,
+    # BEFORE content -- see ELF.__call__'s concatenation order.
+    num_special = model.num_model_mode_tokens + model.num_time_tokens + model.num_self_cond_cfg_tokens
+    is_clean_full = np.concatenate([np.ones(num_special, dtype=bool), is_clean_content])
+    clean_idx = np.where(is_clean_full)[0]
+    active_idx = np.where(~is_clean_full)[0]
+
+    rng, a_rng, b_rng = jax.random.split(rng, 3)
+    base_x = jax.random.normal(a_rng, (batch_size, seq_len, d_model))
+    active_fill_a = jax.random.normal(a_rng, (batch_size, seq_len, d_model))
+    active_fill_b = jax.random.normal(b_rng, (batch_size, seq_len, d_model))
+    is_clean_content_b = role_clean_mask[:, :, None]
+    x_a = jnp.where(is_clean_content_b, base_x, active_fill_a)
+    x_b = jnp.where(is_clean_content_b, base_x, active_fill_b)
+    assert not jnp.allclose(x_a, x_b), "test setup bug: active region identical"
+
+    def run(x):
+        _, mutated = model.apply(
+            {"params": params}, x, t, deterministic=True,
+            self_cond_cfg_scale=self_cond_cfg_scale, decoder_step_active=jnp.array(True),
+            role_clean_mask=role_clean_mask,
+            capture_intermediates=lambda mdl, method_name: isinstance(mdl, ELFBlock),
+            mutable=["intermediates"],
+        )
+        return mutated["intermediates"]
+
+    inter_a = run(x_a)
+    inter_b = run(x_b)
+    for block_name in inter_a:
+        out_a = np.array(inter_a[block_name]["__call__"][0])
+        out_b = np.array(inter_b[block_name]["__call__"][0])
+        clean_a, clean_b = out_a[:, clean_idx], out_b[:, clean_idx]
+        assert np.allclose(clean_a, clean_b, atol=1e-4), (
+            f"Fix C regression: clean/special hidden states at {block_name} changed "
+            f"when only active-region input changed"
+        )
+        active_a, active_b = out_a[:, active_idx], out_b[:, active_idx]
+        assert not np.allclose(active_a, active_b, atol=1e-5), (
+            f"test setup bug: active hidden states at {block_name} identical despite "
+            f"differing input"
+        )
+    print("[OK] Fix C: clean/special hidden states invariant to active-region input "
+          f"across all {model.depth} transformer layers")
 
 
 def test_staggered_timesteps_schedule_shape():
@@ -395,6 +659,9 @@ def test_round_count_reweighting_fixes_bias():
 if __name__ == "__main__":
     test_sample_block_round_invariants()
     test_train_step_block_mode_finite_loss()
+    test_fix_a_no_future_leak_into_committed_encoding()
+    test_fix_b_tight_packing_and_target_relative_extraction()
+    test_fix_c_no_active_leak_into_clean_hidden_states()
     test_staggered_timesteps_schedule_shape()
     test_staggered_noise_finite_loss_and_trains_pos_embedder()
     test_round_count_reweighting_fixes_bias()

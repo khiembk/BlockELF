@@ -42,6 +42,22 @@
 # come from the fixed target_capacity, matching the reference repo's block_size
 # granularity. See `utils/block_utils.compute_staggered_timesteps` for the exact change.
 #
+# v4 (this file, second bug fix): the v3 fix was correct but exposed a second,
+# independent mismatch — v3's checkpoint_116000 (confirmed via eval) showed severe,
+# near-total single-word collapse (99/100 samples dominated by one repeated word,
+# entropy 0.53), worse than the earlier checkpoint_26000, despite 90k more steps and
+# lower loss. Cause: `time_schedule: "logit_normal"` (p_mean=-1.5) biases t_global
+# toward LOW values, correct for the ORIGINAL position-independent objective (every
+# position shares one noise level, so the near-1/"easy" region needs little training
+# attention) but wrong once positions have individual effective timesteps: a position
+# near the end of a target region only reaches a resolved t_pos once t_global
+# approaches 1, which logit_normal(-1.5) makes rare -- starving most positions of
+# "resolved" training signal. Confirmed the reference `setdlms` repo samples its global
+# t strictly UNIFORMLY for StaggeredNoise (`src/datasets/collator.py::
+# DenoisingCollator._sample_t`), not from any skewed distribution. Fix:
+# `time_schedule: "uniform"` (see below) -- matches the reference exactly, training-only
+# (sample_timesteps already supports "uniform"; no code changes needed).
+#
 # This remains a training-only change: sampling/inference is untouched (still one
 # global `t` per round, per the Algorithm 2 contract), so eval_block_uncond.py and
 # generation.py work unmodified against checkpoints from this config (the model's
@@ -69,11 +85,24 @@ num_self_cond_cfg_tokens: 4
 num_model_mode_tokens: 4
 
 # Denoiser objective
-denoiser_p_mean: -1.5
-denoiser_p_std: 0.8
+denoiser_p_mean: -1.5  # unused: time_schedule=uniform below ignores P_mean/P_std
+denoiser_p_std: 0.8    # (kept for reference / parity with the non-staggered config)
 denoiser_noise_scale: 2.0
 t_eps: 0.05
-time_schedule: "logit_normal"
+# v4 fix: uniform (not logit_normal) global t sampling. The inherited
+# logit_normal(p_mean=-1.5) schedule biases training toward LOW t_global, which is
+# correct for the ORIGINAL position-independent objective (every position shares one
+# noise level, so the "easy" near-1 region needs little training attention) but wrong
+# under the staggered per-position schedule: a position near the end of a target
+# region only reaches a resolved t_pos once t_global approaches 1 (see
+# compute_staggered_timesteps's `loc` -> up to ~1-b). Under logit_normal(-1.5), t_global
+# rarely gets anywhere near 1, so most positions beyond the first few essentially never
+# see "resolved" training signal -- confirmed as the cause of severe single-word
+# collapse (99/100 samples dominated by one token) at checkpoint_116000 of the v3 run.
+# The reference `setdlms` repo samples its global t strictly uniformly for
+# StaggeredNoise (`src/datasets/collator.py::DenoisingCollator._sample_t`, `torch.rand`
+# remapped into [eps, 1-eps]) -- matching that here is the faithful fix.
+time_schedule: "uniform"
 
 # Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
 use_block_revelation: true
@@ -122,10 +151,9 @@ save_freq: 0.004224
 eval_freq: 0.021124
 
 # Output
-# New output_dir (not v1's or v2's) — the staggered-schedule computation itself
-# changed (per-example length normalization bug fix), so auto-resume must not pick up
-# the old (buggy) checkpoints.
-output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-block16-staggered-v3"
+# New output_dir (not v1's, v2's, or v3's) — the time-sampling distribution itself
+# changed, so auto-resume must not pick up the old (logit_normal-trained) checkpoints.
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-lm1b-block16-staggered-v4"
 hf_repo_id: null
 resume: null
 
@@ -133,7 +161,7 @@ resume: null
 use_wandb: false
 wandb_project: elf
 wandb_entity:
-wandb_run_name: elf_b-lm1b-block16-staggered-v3
+wandb_run_name: elf_b-lm1b-block16-staggered-v4
 
 # Misc
 seed: 42

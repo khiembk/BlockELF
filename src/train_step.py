@@ -11,7 +11,7 @@ from utils.sampling_utils import (
     sample_cfg_scale, add_noise, sample_timesteps,
     net_out_to_v_x, restore_cond, broadcast_t,
 )
-from utils.block_utils import sample_block_round, compute_staggered_timesteps
+from utils.block_utils import sample_block_round, compute_staggered_timesteps, build_committed_context
 
 
 Array = jnp.ndarray
@@ -40,8 +40,69 @@ def train_step(
         decoder_lambda_rng, decoder_noise_rng, block_rng,
     ) = jax.random.split(current_step_rng, 10)
 
-    # encoder_attention_mask: cond sees cond, x sees all
+    batch_size, seq_length = batch["input_ids"].shape
+
+    cond_seq_mask = batch["cond_seq_mask"][:, :, None]
+    attention_mask = batch["attention_mask"]
+    if config.pad_token == "pad":
+        loss_mask = attention_mask
+    else:
+        loss_mask = jnp.ones_like(attention_mask)
+    loss_mask = loss_mask * (1 - batch["cond_seq_mask"])
+
+    # encoder_attention_mask: cond sees cond, x sees all (legacy default, used whenever
+    # block revelation is off or staggered-noise is on — see below).
     encoder_attention_mask = batch["encoder_attention_mask"]
+
+    # Block-to-block (fixed-commitment) revelation: teacher-force a committed target
+    # prefix {1,...,k*b} this round and restrict noise/loss to the remaining ("active")
+    # target positions. `clean_mask` generalizes `cond_seq_mask` (source-only) to also
+    # cover the committed target prefix; everywhere else keeps using `cond_seq_mask`
+    # unchanged (e.g. CFG label-drop below only ever drops the source sentence).
+    #
+    # Fix A: the committed/active split must be sampled BEFORE the frozen T5 encoder
+    # runs, and the encoder's own self-attention mask must respect it (clean queries
+    # see only clean keys; active queries see everything valid) -- otherwise the
+    # "committed" embeddings `encode_text` produces are contextualized with bidirectional
+    # access to the as-yet-unrevealed active target region, which inference's
+    # `build_committed_context` (re-encoding only actually-generated tokens each round)
+    # can never replicate. Reuses `build_committed_context` so train/infer construct the
+    # committed context identically.
+    clean_mask = cond_seq_mask
+    t_pos = None
+    role_clean_mask = None
+    if config.use_block_revelation:
+        if config.use_staggered_noise:
+            # Faithful SetDLM-style schedule (see block_utils.compute_staggered_timesteps):
+            # every target position gets its own continuous, smoothly-varying effective
+            # timestep in one pass — no discrete per-round committed/active split, no
+            # sample_block_round call, at all. clean_mask/loss_mask therefore stay at
+            # their pre-block-revelation defaults (source-only clean, all valid target
+            # positions supervised); add_noise's existing cond_seq_mask override still
+            # forces source positions clean regardless of what the schedule says there.
+            # No committed/active split exists in this path, so neither Fix A's leak nor
+            # Fix C's role-masking applies here (nothing "committed" vs. "active" to
+            # distinguish) -- encoder_attention_mask stays the legacy default above,
+            # role_clean_mask stays None (unrestricted bidirectional attention, as
+            # every pre-Fix-C staggered-noise checkpoint already trained with).
+            pass
+        else:
+            committed_mask_2d, active_mask_2d, boundary = sample_block_round(
+                block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
+            )
+            clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
+            loss_mask = active_mask_2d
+            encoder_attention_mask, _, _ = build_committed_context(
+                is_source=batch["cond_seq_mask"] > 0,
+                is_committed_target=committed_mask_2d > 0,
+                is_valid=attention_mask > 0,
+            )
+            # Fix C: the ELF denoiser's own self-attention must respect the same
+            # clean/active role split as the T5 encoder above -- clean (source +
+            # committed) queries should not have their representation influenced by
+            # this step's randomly-sampled active-region noise, which inference's
+            # fresh re-encoding of only-ever-committed context can never replicate.
+            role_clean_mask = clean_mask[:, :, 0]
 
     # Label drop before encoding: prevent target tokens from attending to
     # condition tokens so x0 is truly unconditional for dropped samples.
@@ -61,8 +122,6 @@ def train_step(
         latent_std=latent_std,
     )
 
-    batch_size, seq_length = x0.shape[0], x0.shape[1]
-
     t = sample_timesteps(
         t_rng, batch_size,
         P_mean=config.denoiser_p_mean, P_std=config.denoiser_p_std,
@@ -71,40 +130,11 @@ def train_step(
 
     noise = jax.random.normal(noise_rng, x0.shape, dtype=x0.dtype)
 
-    cond_seq_mask = batch["cond_seq_mask"][:, :, None]
-    attention_mask = batch["attention_mask"]
-    if config.pad_token == "pad":
-        loss_mask = attention_mask
-    else:
-        loss_mask = jnp.ones_like(attention_mask)
-    loss_mask = loss_mask * (1 - batch["cond_seq_mask"])
-
-    # Block-to-block (fixed-commitment) revelation: teacher-force a committed target
-    # prefix {1,...,k*b} this round and restrict noise/loss to the remaining ("active")
-    # target positions. `clean_mask` generalizes `cond_seq_mask` (source-only) to also
-    # cover the committed target prefix; everywhere else keeps using `cond_seq_mask`
-    # unchanged (e.g. CFG label-drop below only ever drops the source sentence).
-    clean_mask = cond_seq_mask
-    t_pos = None
-    if config.use_block_revelation:
-        if config.use_staggered_noise:
-            # Faithful SetDLM-style schedule (see block_utils.compute_staggered_timesteps):
-            # every target position gets its own continuous, smoothly-varying effective
-            # timestep in one pass — no discrete per-round committed/active split, no
-            # sample_block_round call, at all. clean_mask/loss_mask therefore stay at
-            # their pre-block-revelation defaults (source-only clean, all valid target
-            # positions supervised); add_noise's existing cond_seq_mask override still
-            # forces source positions clean regardless of what the schedule says there.
-            target_capacity = config.max_length - (config.max_input_length or 0)
-            t_pos = compute_staggered_timesteps(
-                t, batch["cond_seq_mask"], batch["attention_mask"], config.block_size, target_capacity,
-            )
-        else:
-            committed_mask_2d, active_mask_2d, boundary = sample_block_round(
-                block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
-            )
-            clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
-            loss_mask = active_mask_2d
+    if config.use_block_revelation and config.use_staggered_noise:
+        target_capacity = config.max_length - (config.max_input_length or 0)
+        t_pos = compute_staggered_timesteps(
+            t, batch["cond_seq_mask"], batch["attention_mask"], config.block_size, target_capacity,
+        )
 
     # t_phys is the *physical* per-position noise level actually applied (scalar `t`
     # when staggering is off, so this is a no-op in that case); `t` itself is kept
@@ -165,6 +195,7 @@ def train_step(
             deterministic=True,
             self_cond_cfg_scale=self_cond_cfg_input,
             t_pos=t_pos,
+            role_clean_mask=role_clean_mask,
         )
         net_out_init = jax.lax.stop_gradient(net_out_init)
         _, x_pred_init = net_out_to_v_x(net_out_init, z, t_phys_in, t_eps)
@@ -183,6 +214,7 @@ def train_step(
             "self_cond_cfg_scale": self_cond_cfg_scale,
             "deterministic": True,
             "t_pos": t_pos,
+            "role_clean_mask": role_clean_mask,
         }
         if config.self_cond_prob == 0:
             net_out_uncod = state.apply_fn({"params": params}, z, t, **kwargs)
@@ -256,6 +288,7 @@ def train_step(
                 self_cond_cfg_scale=self_cond_cfg_scale,
                 decoder_step_active=jnp.array(False),
                 t_pos=t_pos,
+                role_clean_mask=role_clean_mask,
             )
             v_pred, _ = net_out_to_v_x(net_out, denoiser_z, denoiser_t, t_eps)
             v_final_target = get_v_target(

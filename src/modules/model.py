@@ -75,7 +75,7 @@ class ELF(nn.Module):
     @nn.compact
     def __call__(
         self, x, t, attention_mask=None, deterministic=True,
-        self_cond_cfg_scale=None, decoder_step_active=None, t_pos=None,
+        self_cond_cfg_scale=None, decoder_step_active=None, t_pos=None, role_clean_mask=None,
     ):
         """x: (N, S, C) or (N, S, 2C) with self-cond. t: (N,). attention_mask: (N, S), 1=valid.
 
@@ -85,6 +85,20 @@ class ELF(nn.Module):
         multi-round curriculum — see utils/block_utils.compute_staggered_timesteps).
         None (default) for every existing non-staggered config/checkpoint: in that case
         no extra params are created here and behavior is exactly as before.
+
+        role_clean_mask: optional (N, S) bool, 1 at "clean" content positions (source +
+        already-committed target, during block-revelation training/inference) — Fix C:
+        builds a role-based self-attention mask so clean queries can only attend to
+        clean keys (their representation must stay invariant to active/noisy content),
+        while active queries still attend to everything (clean + active), matching
+        `utils.block_utils.build_committed_context`'s rule for the frozen T5 encoder,
+        now applied to this model's own self-attention too. Prepended special tokens
+        (prefix time/self-cond-cfg tokens, model-mode tokens) are treated as "clean"
+        queries (so their own representation can't be indirectly tainted by active
+        content either) but remain visible as *keys* to every query, clean or active,
+        so active positions still receive time/CFG/mode conditioning. None (default):
+        no behavior change, `attention_mask` is used exactly as before (unrestricted
+        bidirectional attention when also None, as in every pre-Fix-C config).
         """
         patch_size = 1
         head_dim = self.hidden_size // self.num_heads
@@ -131,6 +145,18 @@ class ELF(nn.Module):
             if attention_mask is not None:
                 prefix_mask = jnp.ones((B, prefix_len), dtype=attention_mask.dtype)
                 attention_mask = jnp.concatenate([prefix_mask, attention_mask], axis=1)
+
+        if role_clean_mask is not None:
+            # Fix C: build the full (B, S_total, S_total) role-based query/key mask,
+            # covering the prepended special tokens too (treated as "clean" queries,
+            # but visible as keys to every query -- see docstring). Overrides whatever
+            # the generic `attention_mask is not None` extension above would have done,
+            # since that logic only ever chains a simple 1-D validity mask, not a role.
+            is_clean_special = jnp.ones((B, model_mode_offset + prefix_len), dtype=bool)
+            is_clean_full = jnp.concatenate([is_clean_special, role_clean_mask.astype(bool)], axis=1)
+            is_clean_q = is_clean_full[:, :, None]
+            is_clean_k = is_clean_full[:, None, :]
+            attention_mask = jnp.where(is_clean_q, is_clean_k, jnp.ones_like(is_clean_k)).astype(x.dtype)
 
         feat_rope = TextRotaryEmbeddingFast(
             dim=head_dim, pt_seq_len=self.max_length,

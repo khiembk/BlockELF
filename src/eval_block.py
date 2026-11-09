@@ -131,6 +131,13 @@ def main():
             break
         source_ids = jnp.array(batch["input_ids"])[:, :config.max_input_length]
         source_lengths = jnp.array(batch["cond_seq_mask"]).astype(jnp.int32).sum(axis=1)
+        # Fix B (prerequisite): batch["input_ids"] is packed TIGHT as
+        # [source][target][pad] (see data_utils.py's collate_fn), so a naive
+        # fixed-width prefix leaks real ground-truth TARGET tokens into source_ids
+        # whenever source_lengths[i] < max_input_length. Mask anything past each row's
+        # real source length back to pad, so generation never sees reference content.
+        src_pos = jnp.arange(config.max_input_length)[None, :]
+        source_ids = jnp.where(src_pos < source_lengths[:, None], source_ids, pad_token_id)
 
         rng, gen_rng = jax.random.split(rng)
         texts = generate_block_cond(
