@@ -41,8 +41,11 @@ def run_generation(
     config,
     rng: PRNGKey,
     local_batch_size: int,
-) -> PRNGKey:
-    """Run test generation.
+):
+    """Run test generation. Returns `(rng, best_metric)` — `best_metric` is the first
+    sampling config's Gen. PPL (lower is better) when block mode is on and online_eval
+    is enabled, else None (e.g. full-sequence path, or BLEU-scored conditional runs,
+    where "best" isn't a single comparable scalar across configs here).
 
     Fix D: when `config.use_block_revelation` is set, dispatch to the actual
     block-to-block (Algorithm 2) samplers (`generate_block_cond`/`generate_block_uncond`,
@@ -52,7 +55,8 @@ def run_generation(
     so this periodic in-training/eval.py generation measured the WRONG inference
     algorithm for Stage-1 — the only correctly-routed entry points were the separate
     manual scripts `eval_block.py`/`eval_block_uncond.py`. When
-    `use_block_revelation=False`, behavior here is unchanged.
+    `use_block_revelation=False`, behavior here is unchanged (aside from the new return
+    shape, which every caller must now unpack).
     """
     if config.use_block_revelation:
         return _run_block_generation(
@@ -84,7 +88,7 @@ def run_generation(
                 dataset=eval_dataset,
             )
 
-    return rng
+    return rng, None
 
 
 def _run_block_generation(
@@ -114,6 +118,7 @@ def _run_block_generation(
     epoch_val = int(state_unreplicated.epoch)
     step_val = int(state_unreplicated.step)
     pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
+    first_config_ppl = None  # from sampling_configs[0] only, for best-checkpoint tracking
 
     for sc_idx, sc in enumerate(config.sampling_configs):
         if len(config.sampling_configs) > 1:
@@ -135,11 +140,22 @@ def _run_block_generation(
 
         wall_start = time.time()
         if eval_dataset is None:
-            hypotheses = generate_block_uncond(
-                state=counting_state, encoder_params=encoder_params_unreplicated,
-                encoder_apply_fn=encoder_apply_fn, tokenizer=tokenizer, config=config,
-                sampling_config=sc, batch_size=local_batch_size, rng=sample_rng,
-            )
+            # Loop batches of local_batch_size until config.num_samples is reached --
+            # generate_block_uncond itself only ever produces one batch per call, so
+            # without this loop the uncond path silently generated exactly
+            # local_batch_size samples (the per-host training batch size) regardless
+            # of config.num_samples, unlike the conditional path below (which already
+            # loops the dataloader until config.num_samples).
+            hypotheses = []
+            while len(hypotheses) < config.num_samples:
+                rng, batch_rng = jax.random.split(rng)
+                batch_texts = generate_block_uncond(
+                    state=counting_state, encoder_params=encoder_params_unreplicated,
+                    encoder_apply_fn=encoder_apply_fn, tokenizer=tokenizer, config=config,
+                    sampling_config=sc, batch_size=local_batch_size, rng=batch_rng,
+                )
+                hypotheses.extend(batch_texts)
+            hypotheses = hypotheses[:config.num_samples]
             references = None
         else:
             dataloader = get_dataloader(
@@ -226,12 +242,14 @@ def _run_block_generation(
                             f"Gen. PPL: {ppl_results['ppl']:.4f}  "
                             f"Mean Entropy: {ppl_results['mean_entropy']:.4f}"
                         )
+                        if sc_idx == 0:
+                            first_config_ppl = ppl_results["ppl"]
 
             with open(os.path.join(out_dir, "metrics.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics_line, ensure_ascii=False) + "\n")
             upload_output_dir_to_hf(config.output_dir, config.hf_repo_id, reason="generation metrics")
 
-    return rng
+    return rng, first_config_ppl
 
 
 # ============================================

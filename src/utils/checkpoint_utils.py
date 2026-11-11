@@ -56,7 +56,7 @@ def _split_hf_path(path: str, min_parts: int) -> Optional[Tuple[str, str]]:
 
 
 
-def save_checkpoint(state: Any, output_dir: str, step: int, hf_repo_id: str = None):
+def save_checkpoint(state: Any, output_dir: str, step: int, hf_repo_id: str = None, keep: int = 10):
     """Save model checkpoint locally, optionally mirroring the output dir to HF."""
     state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state))
     state_dict = {
@@ -73,7 +73,7 @@ def save_checkpoint(state: Any, output_dir: str, step: int, hf_repo_id: str = No
     log_for_0(f"Saving checkpoint to {ckpt_dir}")
 
     checkpoints.save_checkpoint_multiprocess(
-        ckpt_dir, state_dict, step, keep=10, overwrite=True,
+        ckpt_dir, state_dict, step, keep=keep, overwrite=True,
     )
 
     log_for_0(f"Checkpoint written to {ckpt_dir}")

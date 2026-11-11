@@ -228,7 +228,7 @@ def main():
         # the block-to-block samplers when config.use_block_revelation is set, instead
         # of always running the original one-shot full-sequence sampler regardless of
         # config (the confirmed Fix D bug).
-        seed_rng = run_generation(
+        seed_rng, _ = run_generation(
             state=state_replicated, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
             eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
             rng=seed_rng, local_batch_size=local_batch_size,

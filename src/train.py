@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import json
 import yaml
 import logging
 import os
@@ -40,6 +41,7 @@ from utils.train_utils import (
     TrainState, prefetch_to_device, get_optimizer, create_learning_rate_fn,
 )
 from generation import run_generation
+from utils.generation_utils import _build_run_name
 from configs.config import load_config_from_yaml, apply_config_overrides, load_sampling_configs, SamplingConfig
 from modules.model import ELF_models
 from utils.data_utils import get_dataloader, prepare_batch, load_dataset, get_pad_token_id, compute_block_round_counts
@@ -56,6 +58,48 @@ logger = logging.getLogger(__name__)
 for _name in ("absl", "orbax", "tensorstore", "flax.training.checkpoints"):
     logging.getLogger(_name).setLevel(logging.ERROR)
 sys.stdout.reconfigure(line_buffering=True)
+
+
+def _seed_best_ppl(config, min_entropy: float = 2.0):
+    """Best-so-far Gen. PPL (lower is better) from `sampling_configs[0]`'s existing
+    `metrics.jsonl`, so resuming/continuing training doesn't treat a prior run's
+    already-strong checkpoints as if they never happened (best_ppl starting at +inf
+    would make the very next eval round trivially "best" otherwise). Returns +inf if
+    not applicable (no block mode, no prior history, or online_eval off).
+
+    GPT2-based Gen. PPL is easily fooled by degenerate/trivial output (e.g. a mostly-
+    untrained early checkpoint emitting near-empty or very short generations) into
+    reporting an artificially LOW (spuriously "great") score alongside artificially LOW
+    entropy -- confirmed in this project's own history (step ~10k readings of PPL≈1.9-5,
+    entropy≈0.3-0.55, versus healthy later checkpoints at PPL≈70-90, entropy≈3.4-3.8).
+    Requiring `mean_entropy >= min_entropy` excludes those degenerate-output artifacts
+    from seeding the "best so far" baseline, so the real training-progress history
+    (not an early collapse artifact) sets the bar `_maybe_save_best` must beat.
+    """
+    if not (config.use_block_revelation and config.online_eval and config.sampling_configs):
+        return float("inf")
+    sc = config.sampling_configs[0]
+    name = _build_run_name(
+        sc.sampling_method, sc.num_sampling_steps[0], sc.cfgs[0],
+        sc.self_cond_cfg_scales[0], sc.time_schedule, getattr(sc, "sde_gamma", 0.0),
+        suffix="block_uncond" if config.eval_data_path is None else "block_cond",
+    )
+    metrics_path = os.path.join(config.output_dir, name, "metrics.jsonl")
+    if not os.path.isfile(metrics_path):
+        return float("inf")
+    best = float("inf")
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if not (isinstance(entry, dict) and "ppl" in entry and "mean_entropy" in entry):
+                continue
+            if entry["mean_entropy"] < min_entropy:
+                continue
+            best = min(best, float(entry["ppl"]))
+    return best
 
 
 def parse_args():
@@ -337,6 +381,23 @@ def run_training(config):
     # since `current_epoch % eval_freq` with eval_freq < 1 never satisfies `>= 1`. Mirror
     # save_freq's existing fractional handling so fractional eval_freq actually fires.
     last_eval_epoch = resume_epoch_fractional if resume_step > 0 else float(start_epoch)
+    # Best-checkpoint tracking: seeded from this output_dir's existing periodic-eval
+    # history (if any), not +inf, so continuing/resuming training doesn't treat a
+    # prior run's already-strong checkpoints as beaten by the first new eval round.
+    best_ppl = _seed_best_ppl(config)
+    if best_ppl < float("inf"):
+        log_for_0(f"Best-checkpoint tracking seeded from existing history: best_ppl={best_ppl:.4f}")
+
+    def _maybe_save_best(state, step, ppl):
+        nonlocal best_ppl
+        if ppl is None or ppl >= best_ppl:
+            return
+        best_ppl = ppl
+        save_checkpoint(
+            state, os.path.join(config.output_dir, "best"), step,
+            hf_repo_id=config.hf_repo_id, keep=1,
+        )
+        log_for_0(f"New best checkpoint at step {step}: ppl={ppl:.4f}")
 
     for epoch in range(start_epoch, config.epochs):
         log_for_0(f"\nEpoch {epoch + 1}/{config.epochs}")
@@ -435,12 +496,13 @@ def run_training(config):
             if 0 < config.eval_freq < 1:
                 progress = epoch + (global_step - epoch * steps_per_epoch) / steps_per_epoch
                 if progress - last_eval_epoch >= config.eval_freq:
-                    rng = run_generation(
+                    rng, eval_ppl = run_generation(
                         state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
                         eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
                         rng=rng, local_batch_size=local_batch_size,
                     )
                     last_eval_epoch = progress
+                    _maybe_save_best(state, global_step, eval_ppl)
 
         epoch_pbar.close()
         current_epoch = epoch + 1
@@ -452,11 +514,12 @@ def run_training(config):
             log_for_0(f"Saved checkpoint at epoch {current_epoch} (step {global_step})")
 
         if config.eval_freq >= 1 and current_epoch % config.eval_freq == 0:
-            rng = run_generation(
+            rng, eval_ppl = run_generation(
                 state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
                 eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
                 rng=rng, local_batch_size=local_batch_size,
             )
+            _maybe_save_best(state, global_step, eval_ppl)
             last_log_step = global_step
             last_log_time = time.time()
 

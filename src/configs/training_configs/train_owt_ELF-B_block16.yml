@@ -1,0 +1,107 @@
+# Phase 1: block-to-block (fixed-commitment) revelation, OWT (OpenWebText), commit
+# size b=16. Unconditional task (no source), same method as
+# train_lm1b_ELF-B_block16.yml -- only the dataset/sequence-length differ. Verified the
+# dataset (embedded-language-flows/openwebtext-t5, already cached locally) has the same
+# shape as LM1B's (`input_ids` + `sequence_length` columns, no condition columns), so no
+# new data-prep script was needed, unlike LM1B.
+#
+# Key difference from LM1B: OWT documents are LONG and mostly FILL the canvas (mean
+# sequence_length ~957/1024, median 987, only ~3.5% hit the 1024 truncation cap, ~87%
+# are >=900) -- the opposite of LM1B's short/heavily-padded sentences (mean ~35/128).
+# So there's much less padding for Fix C's padding-exclusion to matter on, and
+# `pad_token: eos` is kept mainly for consistency with the LM1B config rather than
+# because padding dominates here.
+#
+# Batch size is a conservative placeholder -- max_length=1024 (8x LM1B's 128) means
+# attention cost is dramatically higher per example; this needs its own OOM-driven
+# smoke test on this shared 2xH100 node, same as LM1B's batch size was tuned (see that
+# file's history comment). Adjust global_batch_size/grad_accum_steps once verified.
+
+# Dataset
+data_path: "embedded-language-flows/openwebtext-t5"
+# No eval_data_path: makes run_generation dispatch to test_generation_uncond (standard
+# one-shot full-canvas sampling) as a per-epoch sanity check; dedicated block-to-block
+# eval is a separate step via eval_block_uncond.py.
+max_length: 1024
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
+use_block_revelation: true
+block_size: 16
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 5.0  # matches train_owt_ELF-B.yml (unconditional task)
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+# No source to drop out (unconditional), so label_drop_prob stays at its 0.0 default.
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — smoke-tested on this node with
+# XLA_PYTHON_CLIENT_PREALLOCATE=false (the default preallocation pool grabs ~75% of
+# each GPU regardless of actual need, so that figure is NOT a real measurement).
+# No other users on this node at the time of tuning, so pushed aggressively instead of
+# the ~50GB/GPU budget used for LM1B (which was shared): global_batch_size=8 (per-device
+# 4) -> ~21GB/GPU; =16 (per-device 8) -> ~43GB/GPU; =24 (per-device 12) -> ~63GB/GPU
+# (77% of 81.5GB, ~19GB safety margin) -- settled here as a good aggressive-but-safe
+# point given scaling is roughly linear (~5.3GB per unit of per-device batch).
+epochs: 1
+global_batch_size: 24
+grad_accum_steps: 5  # effective batch 120, close to LM1B's 128 (128/24 isn't exact)
+blr: 0.001
+weight_decay: 0.0
+warmup_steps: 4000
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+num_samples: 100
+
+# Logging & Checkpointing — save_freq/eval_freq are fraction-of-epoch; with
+# steps_per_epoch = 9737184 // 24 = 405716. eval_freq matches save_freq (every
+# checkpoint save also triggers a 100-sample eval), matching the best-checkpoint
+# tracking pattern used for LM1B's epoch-2 continuation (see train.py's
+# _seed_best_ppl/_maybe_save_best -- config-driven, not LM1B-specific, so this applies
+# automatically here too): save/eval every ~2000 steps -> 2000 / 405716 ≈ 0.004930
+log_freq: 50
+save_freq: 0.004930
+eval_freq: 0.004930
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-owt-block16"
+hf_repo_id: null
+resume: null
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-owt-block16
+
+# Misc
+seed: 42
