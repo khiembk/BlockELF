@@ -128,6 +128,13 @@ class Config:
     output_dir: str = "./output_dir"
     hf_repo_id: str = None  # Optional HF repo id to mirror local outputs/checkpoints.
     resume: str = None
+    # Path to a checkpoint (local or HF) to INITIALIZE params/ema_params1 from, for a
+    # fresh run (step=0, epoch=0, fresh optimizer state) -- e.g. warm-starting
+    # block-revelation training from a pretrained non-block-revelation checkpoint.
+    # Distinct from `resume`, which continues the exact same run (full TrainState,
+    # including opt_state/step/epoch). Ignored if `resume` (or auto-resume) finds an
+    # existing checkpoint in output_dir, since that means this run already started.
+    warm_start_checkpoint: str = None
 
     # Wandb
     use_wandb: bool = False

@@ -60,21 +60,31 @@ for _name in ("absl", "orbax", "tensorstore", "flax.training.checkpoints"):
 sys.stdout.reconfigure(line_buffering=True)
 
 
-def _seed_best_ppl(config, min_entropy: float = 2.0):
+MIN_PLAUSIBLE_PPL = 10.0  # see _is_plausible_ppl
+
+
+def _is_plausible_ppl(ppl):
+    """GPT2-based Gen. PPL is easily fooled by degenerate/trivial output (e.g. a
+    mostly-untrained early checkpoint emitting near-empty, very short, or repetitive
+    generations) into reporting an artificially LOW (spuriously "great") score --
+    confirmed repeatedly in this project's own history (e.g. OWT step ~4k-6k readings
+    of PPL≈1.7-1.9 from pure word-salad repetition, versus healthy checkpoints at
+    PPL≈50-300+). Real, non-degenerate generations from these models have never scored
+    anywhere close to this low, so ppl <= MIN_PLAUSIBLE_PPL is treated as untrustworthy
+    and excluded from both best-checkpoint tracking and its seed.
+    """
+    return ppl is not None and ppl > MIN_PLAUSIBLE_PPL
+
+
+def _seed_best_ppl(config):
     """Best-so-far Gen. PPL (lower is better) from `sampling_configs[0]`'s existing
     `metrics.jsonl`, so resuming/continuing training doesn't treat a prior run's
     already-strong checkpoints as if they never happened (best_ppl starting at +inf
     would make the very next eval round trivially "best" otherwise). Returns +inf if
-    not applicable (no block mode, no prior history, or online_eval off).
-
-    GPT2-based Gen. PPL is easily fooled by degenerate/trivial output (e.g. a mostly-
-    untrained early checkpoint emitting near-empty or very short generations) into
-    reporting an artificially LOW (spuriously "great") score alongside artificially LOW
-    entropy -- confirmed in this project's own history (step ~10k readings of PPL≈1.9-5,
-    entropy≈0.3-0.55, versus healthy later checkpoints at PPL≈70-90, entropy≈3.4-3.8).
-    Requiring `mean_entropy >= min_entropy` excludes those degenerate-output artifacts
-    from seeding the "best so far" baseline, so the real training-progress history
-    (not an early collapse artifact) sets the bar `_maybe_save_best` must beat.
+    not applicable (no block mode, no prior history, or online_eval off). Filters out
+    implausibly-low (degenerate-output) readings -- see _is_plausible_ppl -- so the
+    real training-progress history (not an early collapse artifact) sets the bar
+    `_maybe_save_best` must beat.
     """
     if not (config.use_block_revelation and config.online_eval and config.sampling_configs):
         return float("inf")
@@ -94,9 +104,9 @@ def _seed_best_ppl(config, min_entropy: float = 2.0):
                 entry = json.loads(line)
             except Exception:
                 continue
-            if not (isinstance(entry, dict) and "ppl" in entry and "mean_entropy" in entry):
+            if not (isinstance(entry, dict) and "ppl" in entry):
                 continue
-            if entry["mean_entropy"] < min_entropy:
+            if not _is_plausible_ppl(entry["ppl"]):
                 continue
             best = min(best, float(entry["ppl"]))
     return best
@@ -281,6 +291,21 @@ def run_training(config):
             config.resume = config.output_dir
             log_for_0(f"Auto-resuming from {auto_ckpt}")
 
+    # Warm-start: seed params/ema_params1 from a pretrained checkpoint (different
+    # objective/run) as INITIALIZATION only -- step/epoch/opt_state stay fresh. Only
+    # applies when this run hasn't started yet (no resume found above); once a
+    # checkpoint exists in output_dir, auto-resume takes over and this is skipped.
+    if config.warm_start_checkpoint and not config.resume:
+        try:
+            warm_state, _ = load_checkpoint(config.warm_start_checkpoint, state)
+            state = state.replace(
+                params=warm_state.params, ema_params1=warm_state.ema_params1,
+            )
+            log_for_0(f"Warm-started params/ema_params1 from {config.warm_start_checkpoint}")
+        except Exception as e:
+            log_for_0(f"Error loading warm-start checkpoint: {e}")
+            log_for_0("Continuing training from random initialization")
+
     start_epoch, resume_step = 0, 0
     resume_epoch_fractional = 0.0  # Fractional epoch for save-point tracking
     if config.resume:
@@ -390,7 +415,7 @@ def run_training(config):
 
     def _maybe_save_best(state, step, ppl):
         nonlocal best_ppl
-        if ppl is None or ppl >= best_ppl:
+        if not _is_plausible_ppl(ppl) or ppl >= best_ppl:
             return
         best_ppl = ppl
         save_checkpoint(

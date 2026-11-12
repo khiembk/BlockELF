@@ -83,19 +83,33 @@ sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
 num_samples: 100
 
 # Logging & Checkpointing — save_freq/eval_freq are fraction-of-epoch; with
-# steps_per_epoch = 9737184 // 24 = 405716. eval_freq matches save_freq (every
-# checkpoint save also triggers a 100-sample eval), matching the best-checkpoint
-# tracking pattern used for LM1B's epoch-2 continuation (see train.py's
-# _seed_best_ppl/_maybe_save_best -- config-driven, not LM1B-specific, so this applies
-# automatically here too): save/eval every ~2000 steps -> 2000 / 405716 ≈ 0.004930
+# steps_per_epoch = 9737184 // 24 = 405716. save_freq stays frequent (every ~2000
+# steps -> 0.004930) for cheap checkpointing; eval_freq is MUCH less frequent than
+# save_freq here (unlike LM1B, where they matched) because a full eval round (both
+# sampling configs, 100 samples each) measured ~69 minutes wall-clock at this sequence
+# length (eager, uncached generate_block_uncond loop over a 1024-token canvas, up to 64
+# revelation rounds/sample) -- matching save_freq would have spent ~78% of total
+# wall-clock on eval alone across the full epoch. eval every ~10000 steps ->
+# 10000 / 405716 ≈ 0.024648.
 log_freq: 50
 save_freq: 0.004930
-eval_freq: 0.004930
+eval_freq: 0.024648
 
 # Output
 output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-owt-block16"
 hf_repo_id: null
 resume: null
+# Warm-start: from-scratch block-revelation training on OWT showed unstable, oscillating
+# generation quality (eval ppl got WORSE over training: step 10k ppl~1.9 (degenerate) ->
+# step 20k ppl~1.24 (more collapsed) -> step 30k ALL 100 samples empty), despite smoothly
+# declining training loss. Switched to warm-starting from the existing pretrained
+# (non-block-revelation) ELF-B OWT checkpoint instead of random init. Verified this
+# checkpoint is genuinely trained (step=95085, epoch=5, non-trivial param norms, no NaNs)
+# -- NOT a random-init artifact despite the "checkpoint_0" directory name (same
+# architecture: ELF-B, bottleneck_dim=128, num_time_tokens=4, etc., matches exactly).
+# Only params/ema_params1 are loaded; step/epoch/opt_state stay fresh (see
+# config.warm_start_checkpoint in train.py).
+warm_start_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-owt/checkpoint_0"
 
 # Wandb
 use_wandb: false
