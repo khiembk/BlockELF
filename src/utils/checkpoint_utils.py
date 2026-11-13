@@ -212,6 +212,14 @@ def _restore_checkpoint(checkpoint_path: str, target: Any):
          that may have been saved with the old Flax msgpack / orbax format.
     """
     local = _local_path(checkpoint_path)
+    if not os.path.exists(local):
+        # flax.training.checkpoints.restore_checkpoint silently returns `target`
+        # UNCHANGED when nothing is found at `local` (its documented "resume if it
+        # exists" behavior) instead of raising -- which previously let a stale/missing
+        # checkpoint path silently evaluate a fresh-initialized (step=0, random) model
+        # as if it were the requested checkpoint. Bail out early so the caller sees a
+        # real "not found" failure instead of a quietly-wrong restore.
+        return None
 
     # Resolve directory → latest checkpoint file
     resolved = local
