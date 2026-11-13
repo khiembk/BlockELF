@@ -79,7 +79,11 @@ optimizer: muon
 ema_decay1: 0.9999
 
 # Sampling
-sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs.yml"
+# Pinned sde_gamma=1.5 for BOTH step counts (uncond_sampling_configs.yml varies gamma
+# per entry too, which confounded the step-count comparison -- see
+# uncond_sampling_configs_owt_gamma15.yml's header comment for the ablation that found
+# this).
+sampling_configs_path: "configs/sampling_configs/uncond_sampling_configs_owt_gamma15.yml"
 num_samples: 100
 
 # Logging & Checkpointing — save_freq/eval_freq are fraction-of-epoch; with

@@ -1,0 +1,21 @@
+# OWT block16 periodic-eval configs with sde_gamma PINNED to 1.5 across both step
+# counts (unlike uncond_sampling_configs.yml, which also varies gamma per entry: 1.5
+# at 32 steps, 1.0 at 64 steps). That confound made 64 steps look consistently worse
+# than 32 steps during training (e.g. step 40004: ppl 25.8 vs 35.9). An isolated
+# ablation (gamma pinned to 1.5 for both) showed the opposite: 64 steps beats 32 steps
+# once gamma is held constant (step 30003: 28.99 vs 35.97; step 40004: 24.87 vs 25.80).
+# Switching the periodic eval to this file going forward.
+- sampling_method: sde
+  num_sampling_steps: [32]
+  cfgs: [1]
+  sde_gamma: 1.5
+  self_cond_cfg_scales: [3]
+  time_schedule: logit_normal
+
+
+- sampling_method: sde
+  num_sampling_steps: [64]
+  cfgs: [1]
+  sde_gamma: 1.5
+  self_cond_cfg_scales: [3]
+  time_schedule: logit_normal
