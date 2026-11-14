@@ -46,14 +46,16 @@ label_drop_prob: 0.1
 self_cond_prob: 0.5
 
 # Training (optimizer + schedule) — originally scaled for 2x A40 (~27GB/GPU target,
-# global_batch_size=64); re-tuned for 2x H100 (80GB) -- smoke-tested at batch_size=256
-# with XLA_PYTHON_CLIENT_PREALLOCATE=false: ~40GB/38GB per GPU (comfortable headroom),
-# ~2.5-2.8 it/s, multiple clean checkpoint saves. save_freq/eval_freq below are
-# unaffected by the batch-size change (save_freq is fraction-of-epoch, so it still
-# saves every ~2000 *examples-equivalent* regardless of batch; eval_freq is
-# epoch-count-based, so it still means "every 5 full data passes").
+# global_batch_size=64); re-tuned for 2x H100 (80GB). global_batch_size=256 measured
+# ~40GB/38GB per GPU; 512 OOM'd immediately (tried to allocate ~67GB in a single op,
+# memory scales worse than linearly here, likely attention/activation costs). Settled
+# on 384 (~64GB/GPU, smoke-tested safe through multiple checkpoint saves) as a good
+# aggressive-but-safe point given no one else is on this node. save_freq below is
+# unaffected by the batch-size change (fraction-of-epoch, so it still saves every
+# ~2000 *examples-equivalent* regardless of batch) -- see eval_freq's own comment for
+# why it was switched off the epoch-count convention.
 epochs: 20
-global_batch_size: 256
+global_batch_size: 384
 blr: 0.001
 weight_decay: 0.0
 warmup_steps: 500
@@ -68,10 +70,15 @@ num_samples: 64
 
 # Logging & Checkpointing
 # save_freq is a fraction-of-epoch; steps_per_epoch = 4508785 // 64 = 70449, so
-# 2000 / 70449 ≈ 0.0283876 saves a checkpoint roughly every 2000 steps.
+# 2000 / 70449 ≈ 0.0283876 saves a checkpoint roughly every 2000 steps. At
+# global_batch_size=384, steps_per_epoch=11741, so save_freq's SAME fraction now means
+# every ~333 raw steps -- equivalent in examples-seen terms, so left unchanged.
+# eval_freq switched from the original epoch-count convention (every 5 epochs, i.e.
+# ~58705 steps at this batch size -- too infrequent) to a fractional-epoch value
+# meaning "every ~10000 steps": 10000 / 11741 ≈ 0.851716.
 log_freq: 10
 save_freq: 0.0283876
-eval_freq: 5
+eval_freq: 0.851716
 
 # Output
 output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16"
