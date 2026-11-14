@@ -42,10 +42,10 @@ def run_generation(
     rng: PRNGKey,
     local_batch_size: int,
 ):
-    """Run test generation. Returns `(rng, best_metric)` — `best_metric` is the first
-    sampling config's Gen. PPL (lower is better) when block mode is on and online_eval
-    is enabled, else None (e.g. full-sequence path, or BLEU-scored conditional runs,
-    where "best" isn't a single comparable scalar across configs here).
+    """Run test generation. Returns `(rng, ppl, mean_entropy)` from the first sampling
+    config when block mode is on and online_eval is enabled, else `(rng, None, None)`
+    (e.g. full-sequence path, or BLEU-scored conditional runs, where there's no single
+    comparable scalar across configs here).
 
     Fix D: when `config.use_block_revelation` is set, dispatch to the actual
     block-to-block (Algorithm 2) samplers (`generate_block_cond`/`generate_block_uncond`,
@@ -88,7 +88,7 @@ def run_generation(
                 dataset=eval_dataset,
             )
 
-    return rng, None
+    return rng, None, None
 
 
 def _run_block_generation(
@@ -119,6 +119,7 @@ def _run_block_generation(
     step_val = int(state_unreplicated.step)
     pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
     first_config_ppl = None  # from sampling_configs[0] only, for best-checkpoint tracking
+    first_config_entropy = None
 
     for sc_idx, sc in enumerate(config.sampling_configs):
         if len(config.sampling_configs) > 1:
@@ -244,12 +245,13 @@ def _run_block_generation(
                         )
                         if sc_idx == 0:
                             first_config_ppl = ppl_results["ppl"]
+                            first_config_entropy = ppl_results["mean_entropy"]
 
             with open(os.path.join(out_dir, "metrics.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics_line, ensure_ascii=False) + "\n")
             upload_output_dir_to_hf(config.output_dir, config.hf_repo_id, reason="generation metrics")
 
-    return rng, first_config_ppl
+    return rng, first_config_ppl, first_config_entropy
 
 
 # ============================================

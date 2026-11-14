@@ -60,20 +60,23 @@ for _name in ("absl", "orbax", "tensorstore", "flax.training.checkpoints"):
 sys.stdout.reconfigure(line_buffering=True)
 
 
-MIN_PLAUSIBLE_PPL = 10.0  # see _is_plausible_ppl
+MIN_PLAUSIBLE_ENTROPY = 3.0  # see _is_plausible
 
 
-def _is_plausible_ppl(ppl):
+def _is_plausible(ppl, entropy):
     """GPT2-based Gen. PPL is easily fooled by degenerate/trivial output (e.g. a
-    mostly-untrained early checkpoint emitting near-empty, very short, or repetitive
-    generations) into reporting an artificially LOW (spuriously "great") score --
-    confirmed repeatedly in this project's own history (e.g. OWT step ~4k-6k readings
-    of PPL≈1.7-1.9 from pure word-salad repetition, versus healthy checkpoints at
-    PPL≈50-300+). Real, non-degenerate generations from these models have never scored
-    anywhere close to this low, so ppl <= MIN_PLAUSIBLE_PPL is treated as untrustworthy
-    and excluded from both best-checkpoint tracking and its seed.
+    mostly-untrained or collapsed checkpoint emitting near-empty, very short, or
+    repetitive generations) into reporting an artificially LOW (spuriously "great")
+    score -- confirmed repeatedly in this project's own history (e.g. OWT step ~4k-6k
+    readings of PPL≈1.7-1.9 from pure word-salad repetition). A fixed PPL floor
+    (previously 10.0) is NOT a reliable filter once the model genuinely improves past
+    it -- confirmed checkpoints at step 136k-156k score PPL≈8-9.7 with NO degeneration
+    (zero empty outputs at 1000-sample scale, entropy~4.4-4.5). Mean token entropy is
+    the more robust signal: degenerate/repetitive output collapses entropy to ~0.3-1.8,
+    while every genuinely healthy checkpoint observed so far (even the best ones) stays
+    >=4.4. Require entropy > MIN_PLAUSIBLE_ENTROPY instead of a PPL floor.
     """
-    return ppl is not None and ppl > MIN_PLAUSIBLE_PPL
+    return ppl is not None and entropy is not None and entropy > MIN_PLAUSIBLE_ENTROPY
 
 
 def _seed_best_ppl(config):
@@ -82,9 +85,9 @@ def _seed_best_ppl(config):
     already-strong checkpoints as if they never happened (best_ppl starting at +inf
     would make the very next eval round trivially "best" otherwise). Returns +inf if
     not applicable (no block mode, no prior history, or online_eval off). Filters out
-    implausibly-low (degenerate-output) readings -- see _is_plausible_ppl -- so the
-    real training-progress history (not an early collapse artifact) sets the bar
-    `_maybe_save_best` must beat.
+    implausibly-low (degenerate-output) readings -- see _is_plausible -- so the real
+    training-progress history (not a collapse artifact) sets the bar `_maybe_save_best`
+    must beat.
     """
     if not (config.use_block_revelation and config.online_eval and config.sampling_configs):
         return float("inf")
@@ -104,9 +107,9 @@ def _seed_best_ppl(config):
                 entry = json.loads(line)
             except Exception:
                 continue
-            if not (isinstance(entry, dict) and "ppl" in entry):
+            if not (isinstance(entry, dict) and "ppl" in entry and "mean_entropy" in entry):
                 continue
-            if not _is_plausible_ppl(entry["ppl"]):
+            if not _is_plausible(entry["ppl"], entry["mean_entropy"]):
                 continue
             best = min(best, float(entry["ppl"]))
     return best
@@ -413,9 +416,9 @@ def run_training(config):
     if best_ppl < float("inf"):
         log_for_0(f"Best-checkpoint tracking seeded from existing history: best_ppl={best_ppl:.4f}")
 
-    def _maybe_save_best(state, step, ppl):
+    def _maybe_save_best(state, step, ppl, entropy):
         nonlocal best_ppl
-        if not _is_plausible_ppl(ppl) or ppl >= best_ppl:
+        if not _is_plausible(ppl, entropy) or ppl >= best_ppl:
             return
         best_ppl = ppl
         save_checkpoint(
@@ -521,13 +524,13 @@ def run_training(config):
             if 0 < config.eval_freq < 1:
                 progress = epoch + (global_step - epoch * steps_per_epoch) / steps_per_epoch
                 if progress - last_eval_epoch >= config.eval_freq:
-                    rng, eval_ppl = run_generation(
+                    rng, eval_ppl, eval_entropy = run_generation(
                         state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
                         eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
                         rng=rng, local_batch_size=local_batch_size,
                     )
                     last_eval_epoch = progress
-                    _maybe_save_best(state, global_step, eval_ppl)
+                    _maybe_save_best(state, global_step, eval_ppl, eval_entropy)
 
         epoch_pbar.close()
         current_epoch = epoch + 1
@@ -539,12 +542,12 @@ def run_training(config):
             log_for_0(f"Saved checkpoint at epoch {current_epoch} (step {global_step})")
 
         if config.eval_freq >= 1 and current_epoch % config.eval_freq == 0:
-            rng, eval_ppl = run_generation(
+            rng, eval_ppl, eval_entropy = run_generation(
                 state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
                 eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
                 rng=rng, local_batch_size=local_batch_size,
             )
-            _maybe_save_best(state, global_step, eval_ppl)
+            _maybe_save_best(state, global_step, eval_ppl, eval_entropy)
             last_log_step = global_step
             last_log_time = time.time()
 
