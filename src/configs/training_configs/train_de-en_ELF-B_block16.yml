@@ -45,9 +45,15 @@ decoder_p_std: 0.8
 label_drop_prob: 0.1
 self_cond_prob: 0.5
 
-# Training (optimizer + schedule) — scaled for 2x A40, ~27GB/GPU target
+# Training (optimizer + schedule) — originally scaled for 2x A40 (~27GB/GPU target,
+# global_batch_size=64); re-tuned for 2x H100 (80GB) -- smoke-tested at batch_size=256
+# with XLA_PYTHON_CLIENT_PREALLOCATE=false: ~40GB/38GB per GPU (comfortable headroom),
+# ~2.5-2.8 it/s, multiple clean checkpoint saves. save_freq/eval_freq below are
+# unaffected by the batch-size change (save_freq is fraction-of-epoch, so it still
+# saves every ~2000 *examples-equivalent* regardless of batch; eval_freq is
+# epoch-count-based, so it still means "every 5 full data passes").
 epochs: 20
-global_batch_size: 64
+global_batch_size: 256
 blr: 0.001
 weight_decay: 0.0
 warmup_steps: 500
@@ -71,6 +77,13 @@ eval_freq: 5
 output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16"
 hf_repo_id: null
 resume: null
+# Warm-start from the existing pretrained (non-block-revelation) ELF-B WMT14 de-en
+# checkpoint, same approach as OWT's warm-start (see train_owt_ELF-B_block16.yml).
+# Verified genuinely trained: step=880600, epoch=100 (matches train_de-en_ELF-B.yml's
+# epochs=100), not a random-init artifact. Same architecture as this block16 config
+# (ELF-B, bottleneck_dim=128, num_time_tokens=4, etc.), so only params/ema_params1 are
+# loaded; step/epoch/opt_state stay fresh.
+warm_start_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-de-en/checkpoint_0"
 
 # Wandb
 use_wandb: false
