@@ -81,12 +81,14 @@ num_samples: 64
 # 2000 / 70449 ≈ 0.0283876 saves a checkpoint roughly every 2000 steps. At
 # global_batch_size=384, steps_per_epoch=11741, so save_freq's SAME fraction now means
 # every ~333 raw steps -- equivalent in examples-seen terms, so left unchanged.
-# eval_freq switched from the original epoch-count convention (every 5 epochs, i.e.
-# ~58705 steps at this batch size -- too infrequent) to a fractional-epoch value
-# meaning "every ~10000 steps": 10000 / 11741 ≈ 0.851716.
+# eval_freq switched from the original epoch-count convention (every 5 epochs) to a
+# fractional-epoch value; tightened from "every ~10000 steps" to "every ~2000 steps"
+# (matching save_freq's cadence) for finer-grained BLEU tracking given training quality
+# has been unstable (see best-checkpoint tracking in train.py -- _seed_best_bleu /
+# _maybe_save_best's bleu branch): 2000 / 11741 ≈ 0.170343.
 log_freq: 10
 save_freq: 0.0283876
-eval_freq: 0.851716
+eval_freq: 0.170343
 
 # Output
 output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-wmt-de-en-block16"

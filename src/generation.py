@@ -42,10 +42,11 @@ def run_generation(
     rng: PRNGKey,
     local_batch_size: int,
 ):
-    """Run test generation. Returns `(rng, ppl, mean_entropy)` from the first sampling
-    config when block mode is on and online_eval is enabled, else `(rng, None, None)`
-    (e.g. full-sequence path, or BLEU-scored conditional runs, where there's no single
-    comparable scalar across configs here).
+    """Run test generation. Returns `(rng, ppl, mean_entropy, bleu)` from the first
+    sampling config when block mode is on and online_eval is enabled -- `ppl`/`entropy`
+    populated for unconditional (no-reference) tasks, `bleu` populated for conditional
+    (reference-available) tasks, the other left None -- else `(rng, None, None, None)`
+    (e.g. the original full-sequence path).
 
     Fix D: when `config.use_block_revelation` is set, dispatch to the actual
     block-to-block (Algorithm 2) samplers (`generate_block_cond`/`generate_block_uncond`,
@@ -88,7 +89,7 @@ def run_generation(
                 dataset=eval_dataset,
             )
 
-    return rng, None, None
+    return rng, None, None, None
 
 
 def _run_block_generation(
@@ -120,6 +121,7 @@ def _run_block_generation(
     pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
     first_config_ppl = None  # from sampling_configs[0] only, for best-checkpoint tracking
     first_config_entropy = None
+    first_config_bleu = None  # conditional (references available) task equivalent of ppl
 
     for sc_idx, sc in enumerate(config.sampling_configs):
         if len(config.sampling_configs) > 1:
@@ -227,6 +229,8 @@ def _run_block_generation(
                         f"BLEU: {bleu_score:.2f}  ROUGE-1: {rouge_scores['rouge1']:.2f}  "
                         f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}"
                     )
+                    if sc_idx == 0:
+                        first_config_bleu = bleu_score
                 else:
                     nonempty = [s for s in hypotheses if isinstance(s, str) and s.strip()]
                     if nonempty:
@@ -251,7 +255,7 @@ def _run_block_generation(
                 f.write(json.dumps(metrics_line, ensure_ascii=False) + "\n")
             upload_output_dir_to_hf(config.output_dir, config.hf_repo_id, reason="generation metrics")
 
-    return rng, first_config_ppl, first_config_entropy
+    return rng, first_config_ppl, first_config_entropy, first_config_bleu
 
 
 # ============================================

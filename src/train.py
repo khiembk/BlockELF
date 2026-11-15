@@ -115,6 +115,39 @@ def _seed_best_ppl(config):
     return best
 
 
+def _seed_best_bleu(config):
+    """Best-so-far BLEU (higher is better) from `sampling_configs[0]`'s existing
+    `metrics.jsonl`, for conditional (reference-available) tasks -- the BLEU-scored
+    counterpart of `_seed_best_ppl`. Unlike Gen. PPL, BLEU is directly computed against
+    ground-truth references, so degenerate/empty output can't score artificially high
+    (it scores ~0) -- no plausibility filter is needed here. Returns -inf if not
+    applicable (no block mode, no prior history, online_eval off, or no "bleu" field
+    recorded -- i.e. this is an unconditional task).
+    """
+    if not (config.use_block_revelation and config.online_eval and config.sampling_configs):
+        return float("-inf")
+    sc = config.sampling_configs[0]
+    name = _build_run_name(
+        sc.sampling_method, sc.num_sampling_steps[0], sc.cfgs[0],
+        sc.self_cond_cfg_scales[0], sc.time_schedule, getattr(sc, "sde_gamma", 0.0),
+        suffix="block_uncond" if config.eval_data_path is None else "block_cond",
+    )
+    metrics_path = os.path.join(config.output_dir, name, "metrics.jsonl")
+    if not os.path.isfile(metrics_path):
+        return float("-inf")
+    best = float("-inf")
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if not (isinstance(entry, dict) and "bleu" in entry):
+                continue
+            best = max(best, float(entry["bleu"]))
+    return best
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train ELF Diffusion Model (JAX).")
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file to override defaults.")
@@ -415,9 +448,25 @@ def run_training(config):
     best_ppl = _seed_best_ppl(config)
     if best_ppl < float("inf"):
         log_for_0(f"Best-checkpoint tracking seeded from existing history: best_ppl={best_ppl:.4f}")
+    best_bleu = _seed_best_bleu(config)
+    if best_bleu > float("-inf"):
+        log_for_0(f"Best-checkpoint tracking seeded from existing history: best_bleu={best_bleu:.4f}")
 
-    def _maybe_save_best(state, step, ppl, entropy):
-        nonlocal best_ppl
+    def _maybe_save_best(state, step, ppl, entropy, bleu=None):
+        nonlocal best_ppl, best_bleu
+        # Conditional (BLEU-scored) tasks: higher is better, no plausibility filter
+        # needed -- degenerate/empty output can't score artificially high against
+        # ground-truth references (unlike GPT2 Gen. PPL on unconditional tasks).
+        if bleu is not None:
+            if bleu <= best_bleu:
+                return
+            best_bleu = bleu
+            save_checkpoint(
+                state, os.path.join(config.output_dir, "best"), step,
+                hf_repo_id=config.hf_repo_id, keep=1,
+            )
+            log_for_0(f"New best checkpoint at step {step}: bleu={bleu:.4f}")
+            return
         if not _is_plausible(ppl, entropy) or ppl >= best_ppl:
             return
         best_ppl = ppl
@@ -524,13 +573,13 @@ def run_training(config):
             if 0 < config.eval_freq < 1:
                 progress = epoch + (global_step - epoch * steps_per_epoch) / steps_per_epoch
                 if progress - last_eval_epoch >= config.eval_freq:
-                    rng, eval_ppl, eval_entropy = run_generation(
+                    rng, eval_ppl, eval_entropy, eval_bleu = run_generation(
                         state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
                         eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
                         rng=rng, local_batch_size=local_batch_size,
                     )
                     last_eval_epoch = progress
-                    _maybe_save_best(state, global_step, eval_ppl, eval_entropy)
+                    _maybe_save_best(state, global_step, eval_ppl, eval_entropy, eval_bleu)
 
         epoch_pbar.close()
         current_epoch = epoch + 1
@@ -542,12 +591,12 @@ def run_training(config):
             log_for_0(f"Saved checkpoint at epoch {current_epoch} (step {global_step})")
 
         if config.eval_freq >= 1 and current_epoch % config.eval_freq == 0:
-            rng, eval_ppl, eval_entropy = run_generation(
+            rng, eval_ppl, eval_entropy, eval_bleu = run_generation(
                 state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
                 eval_dataset=eval_dataset, tokenizer=tokenizer, config=config,
                 rng=rng, local_batch_size=local_batch_size,
             )
-            _maybe_save_best(state, global_step, eval_ppl, eval_entropy)
+            _maybe_save_best(state, global_step, eval_ppl, eval_entropy, eval_bleu)
             last_log_step = global_step
             last_log_time = time.time()
 
