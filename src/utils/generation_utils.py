@@ -66,11 +66,16 @@ def shift_left(x, shift_per_sample, pad_value=0, axis=1):
 def _sample_step_for_scan(
     model_apply_fn, model_params, config, sampling_config: SamplingConfig,
     cfg_scale, self_cond_cfg_scale, cond_seq, cond_seq_mask, rng=None,
+    attention_mask=None, role_clean_mask=None, cfg_source_mask=None,
 ):
     """Create a scan-compatible step function.
 
     For method == "sde", `rng` must be provided and the scan carry must include a step index
     (z, x_pred, step_idx); fold_in is done per step. Other methods use a (z, x_pred) carry.
+
+    attention_mask/role_clean_mask/cfg_source_mask: optional, see `_forward_sample`'s
+    docstring in sampling_utils.py (conditional_gen_fix.md P0 Fix #1/#2). Default None
+    preserves the original behavior for every existing caller.
     """
     method = sampling_config.sampling_method
     base_kwargs = dict(
@@ -78,6 +83,8 @@ def _sample_step_for_scan(
         config=config,
         cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
         cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        attention_mask=attention_mask, role_clean_mask=role_clean_mask,
+        cfg_source_mask=cfg_source_mask,
     )
 
     if method == "sde":
@@ -114,8 +121,14 @@ def _generate_samples_single_batch(
     model_params, model_apply_fn, rng: PRNGKey, z: Array, t_steps: Array,
     cond_seq: Array, cond_seq_mask: Array, config: Config, sampling_config: SamplingConfig,
     cfg_scale: float, self_cond_cfg_scale: float,
+    attention_mask=None, role_clean_mask=None, cfg_source_mask=None,
 ) -> Array:
-    """Generate samples for a single batch (pmap-compatible, uses lax.scan)."""
+    """Generate samples for a single batch (pmap-compatible, uses lax.scan).
+
+    attention_mask/role_clean_mask/cfg_source_mask: optional, see `_forward_sample`'s
+    docstring in sampling_utils.py (conditional_gen_fix.md P0 Fix #1/#2). Default None
+    preserves the original behavior for every existing (unconditional/non-block) caller.
+    """
     method = sampling_config.sampling_method
     batch_size, max_length, d_model = z.shape
     if cond_seq is None:
@@ -126,6 +139,8 @@ def _generate_samples_single_batch(
         config=config,
         cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
         cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        attention_mask=attention_mask, role_clean_mask=role_clean_mask,
+        cfg_source_mask=cfg_source_mask,
     )
 
     z = restore_cond(z, cond_seq, cond_seq_mask)
@@ -352,11 +367,23 @@ def generate_block_cond(
             time_schedule=sampling_config.time_schedule,
             P_mean=config.denoiser_p_mean, P_std=config.denoiser_p_std,
         )
+        # conditional_gen_fix.md P0 Fix #1: thread the same clean/active role mask
+        # training uses (`clean_mask` = source + committed target; "clean" queries
+        # never attend to "active" keys) into the denoiser's own self-attention here --
+        # previously the sampling call chain passed no attention/role mask at all, so
+        # inference silently ran with fully unmasked attention regardless of what
+        # training taught the model to expect.
+        # P0 Fix #2: CFG's unconditional branch must only drop the SOURCE (matching
+        # training's label-drop, which never touches committed target), not the whole
+        # source+committed `clean_mask` -- otherwise it erases committed-target context
+        # the model was never trained to operate without.
         z_final = _generate_samples_single_batch(
             model_params=model_params, model_apply_fn=model_apply_fn, rng=rng,
             z=z0, t_steps=t_steps, cond_seq=cond_seq, cond_seq_mask=clean_mask,
             config=config, sampling_config=sampling_config,
             cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
+            role_clean_mask=clean_mask,
+            cfg_source_mask=is_source_full.astype(jnp.float32),
         )
         predicted_ids = _dlm_decode_batch(
             z=z_final, model_params=model_params, model_apply_fn=model_apply_fn,

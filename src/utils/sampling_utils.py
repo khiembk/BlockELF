@@ -137,11 +137,18 @@ def net_out_to_v_x(net_out, z, t, t_eps=5e-2):
 def _forward_sample_self_cond(
     model_apply_fn, model_params, z, t_batch, x_pred_prev, config,
     self_cond_cfg_scale, cond_seq, cond_seq_mask,
+    attention_mask=None, role_clean_mask=None,
 ):
-    """Forward pass with self-conditioning."""
+    """Forward pass with self-conditioning.
+
+    attention_mask/role_clean_mask: optional denoiser self-attention masks (see
+    `_forward_sample`'s docstring -- conditional_gen_fix.md P0 Fix #1). Default None
+    preserves the original fully-unmasked behavior for every existing caller.
+    """
     t_eps = config.t_eps
     self_cond_prob = config.self_cond_prob
     _restore_vx = partial(restore_vx, cond_seq=cond_seq, cond_seq_mask=cond_seq_mask)
+    _model_kwargs = dict(attention_mask=attention_mask, role_clean_mask=role_clean_mask)
 
     if config.num_self_cond_cfg_tokens > 0:
         if x_pred_prev is None:
@@ -150,7 +157,7 @@ def _forward_sample_self_cond(
         self_cond_scale_batch = jnp.full((z.shape[0],), self_cond_cfg_scale)
         net_out_cond = model_apply_fn(
             {"params": model_params}, z_input_cond, t_batch, deterministic=True,
-            self_cond_cfg_scale=self_cond_scale_batch,
+            self_cond_cfg_scale=self_cond_scale_batch, **_model_kwargs,
         )
         v_cond, x_cond = net_out_to_v_x(net_out_cond, z, t_batch, t_eps)
         return _restore_vx(v_cond, x_cond)
@@ -158,7 +165,7 @@ def _forward_sample_self_cond(
     # No self-conditioning
     if self_cond_prob == 0:
         net_out = model_apply_fn(
-            {"params": model_params}, z, t_batch, deterministic=True,
+            {"params": model_params}, z, t_batch, deterministic=True, **_model_kwargs,
         )
         v, x = net_out_to_v_x(net_out, z, t_batch, t_eps)
         return _restore_vx(v, x)
@@ -169,6 +176,7 @@ def _forward_sample_self_cond(
         z_input_uncond = jnp.concatenate([z, z_uncond], axis=-1)
         net_out_uncond = model_apply_fn(
             {"params": model_params}, z_input_uncond, t_batch, deterministic=True,
+            **_model_kwargs,
         )
         v_uncond, x_uncond = net_out_to_v_x(net_out_uncond, z, t_batch, t_eps)
         v_uncond, x_uncond = _restore_vx(v_uncond, x_uncond)
@@ -178,6 +186,7 @@ def _forward_sample_self_cond(
     z_input_cond = jnp.concatenate([z, x_pred_prev], axis=-1)
     net_out_cond = model_apply_fn(
         {"params": model_params}, z_input_cond, t_batch, deterministic=True,
+        **_model_kwargs,
     )
     v_cond, x_cond = net_out_to_v_x(net_out_cond, z, t_batch, t_eps)
     v_cond, x_cond = _restore_vx(v_cond, x_cond)
@@ -193,26 +202,52 @@ def _forward_sample_self_cond(
 def _forward_sample(
     model_apply_fn, model_params, z, t_batch, x_pred_prev, config,
     cfg_scale, self_cond_cfg_scale, cond_seq, cond_seq_mask,
+    attention_mask=None, role_clean_mask=None, cfg_source_mask=None,
 ):
-    """Forward pass with optional self-conditioning and CFG."""
+    """Forward pass with optional self-conditioning and CFG.
+
+    attention_mask/role_clean_mask: optional denoiser self-attention masks, threaded
+    through every model forward in this function (conditional_gen_fix.md P0 Fix #1) so
+    block-revelation inference uses the same clean/active role-restricted attention as
+    training's `train_step.py` (clean -- source + committed target -- queries never see
+    active/noisy keys; active queries see everything). Default None preserves the
+    original fully-unmasked behavior for every existing (unconditional/non-block)
+    caller.
+
+    cfg_source_mask: optional, the subset of `cond_seq_mask` the CFG-unconditional
+    branch should actually drop (conditional_gen_fix.md P0 Fix #2). Defaults to
+    `cond_seq_mask` itself -- the original behavior (drop everything marked clean) --
+    for every existing caller, since outside block-revelation `cond_seq_mask` already
+    means "source only" there. Block-revelation conditional generation's `cond_seq_mask`
+    means source + committed target, so it passes a source-only `cfg_source_mask` here:
+    training's label-drop only ever drops the source (never committed target), so the
+    CFG-uncond branch must match that -- dropping committed target context there was
+    erasing information training never taught the model to operate without, and this
+    grew more damaging to generation quality the more fine-tuning specialized the model
+    toward an attention/CFG pattern it never actually saw at inference.
+    """
+    _model_kwargs = dict(attention_mask=attention_mask, role_clean_mask=role_clean_mask)
     v_cond, x_cond = _forward_sample_self_cond(
         model_apply_fn, model_params, z, t_batch, x_pred_prev, config,
         self_cond_cfg_scale=self_cond_cfg_scale,
-        cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        cond_seq=cond_seq, cond_seq_mask=cond_seq_mask, **_model_kwargs,
     )
     if cfg_scale == 1.0:
         return v_cond, x_cond
 
-    # Unconditional forward: zero out cond prefix, no self-cond state, no restore
-    z_uncond = restore_cond(z, jnp.zeros_like(z), cond_seq_mask)
+    # Unconditional forward: zero out only the CFG-droppable (source) prefix, keeping
+    # any committed-target context intact; no self-cond state, no restore.
+    drop_mask = cond_seq_mask if cfg_source_mask is None else cfg_source_mask
+    z_uncond = restore_cond(z, jnp.zeros_like(z), drop_mask)
     x_pred_prev_uncond = (
         None if x_pred_prev is None
-        else restore_cond(x_pred_prev, jnp.zeros_like(x_pred_prev), cond_seq_mask)
+        else restore_cond(x_pred_prev, jnp.zeros_like(x_pred_prev), drop_mask)
     )
+    cond_seq_uncond = restore_cond(cond_seq, jnp.zeros_like(cond_seq), drop_mask)
     v_uncond, x_uncond = _forward_sample_self_cond(
         model_apply_fn, model_params, z_uncond, t_batch, x_pred_prev_uncond, config,
         self_cond_cfg_scale=self_cond_cfg_scale,
-        cond_seq=jnp.zeros_like(cond_seq), cond_seq_mask=cond_seq_mask,
+        cond_seq=cond_seq_uncond, cond_seq_mask=cond_seq_mask, **_model_kwargs,
     )
 
     v_out = v_uncond + cfg_scale * (v_cond - v_uncond)
@@ -225,6 +260,7 @@ def _ode_step(
     model_apply_fn, model_params, z, t, t_next, x_pred_prev,
     config, cfg_scale, self_cond_cfg_scale,
     cond_seq, cond_seq_mask,
+    attention_mask=None, role_clean_mask=None, cfg_source_mask=None,
 ):
     """Single ODE (Euler) step for sampling."""
     t_batch = jnp.full((z.shape[0],), t)
@@ -234,6 +270,8 @@ def _ode_step(
         config=config,
         cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
         cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        attention_mask=attention_mask, role_clean_mask=role_clean_mask,
+        cfg_source_mask=cfg_source_mask,
     )
     return z + (t_next - t) * v_pred, x_pred
 
@@ -243,6 +281,7 @@ def _sde_step(
     model_apply_fn, model_params, z, t, t_next, x_pred_prev,
     config, cfg_scale, self_cond_cfg_scale,
     cond_seq, cond_seq_mask, gamma, rng,
+    attention_mask=None, role_clean_mask=None, cfg_source_mask=None,
 ):
     """Per-step SDE-style sampler with hybrid (t-and-step) noise scaling.
 
@@ -262,5 +301,7 @@ def _sde_step(
         config=config,
         cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
         cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        attention_mask=attention_mask, role_clean_mask=role_clean_mask,
+        cfg_source_mask=cfg_source_mask,
     )
     return z_back + (t_next - t_back) * v_pred, x_pred
