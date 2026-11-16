@@ -93,12 +93,14 @@ class Config:
 
     # Which reference-scored metric to use for conditional-task best-checkpoint
     # tracking (`_seed_best_bleu`/`_maybe_save_best` in train.py): "bleu", "rouge1",
-    # "rouge2", or "rougeL". Only read when references are available (conditional
-    # tasks with eval_data_path set); unconditional tasks always use Gen. PPL instead
-    # (see _seed_best_ppl). Default "bleu" preserves WMT14's existing behavior
-    # (translation quality is conventionally BLEU-scored). Summarization tasks like
-    # XSum should set this to "rougeL" -- ROUGE, not BLEU, is the standard metric for
-    # abstractive summarization; WMT14's config does not set this field, so it keeps
+    # "rouge2", "rougeL", or "rouge_avg" (mean of rouge1/rouge2/rougeL, a composite
+    # score so a single criterion reflects all three rather than only one). Only read
+    # when references are available (conditional tasks with eval_data_path set);
+    # unconditional tasks always use Gen. PPL instead (see _seed_best_ppl). Default
+    # "bleu" preserves WMT14's existing behavior (translation quality is conventionally
+    # BLEU-scored). Summarization tasks like XSum should use "rouge_avg" or a specific
+    # ROUGE variant -- ROUGE, not BLEU, is the standard metric for abstractive
+    # summarization; WMT14's config does not set this field, so it keeps
     # scoring/selecting on BLEU unchanged.
     eval_primary_metric: str = "bleu"
 

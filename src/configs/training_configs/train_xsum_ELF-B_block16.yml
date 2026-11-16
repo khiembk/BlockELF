@@ -83,11 +83,12 @@ sampling_configs_path: "configs/sampling_configs/cond_sampling_configs.yml"
 num_samples: 64
 
 # Best-checkpoint tracking: ROUGE (not BLEU) is the standard metric for abstractive
-# summarization -- best-checkpoint selection should track ROUGE-L, not translation-style
-# BLEU (see configs/config.py's eval_primary_metric docstring). BLEU/ROUGE-1/ROUGE-2 are
-# still computed and logged every eval regardless; this only changes which one gates
-# "New best checkpoint" saves.
-eval_primary_metric: rougeL
+# summarization (see configs/config.py's eval_primary_metric docstring). Use the mean
+# of rouge1/rouge2/rougeL ("rouge_avg") as a single composite selection criterion
+# rather than picking just one of the three. BLEU/ROUGE-1/ROUGE-2/ROUGE-L are all still
+# computed and logged every eval regardless; this only changes which value gates "New
+# best checkpoint" saves.
+eval_primary_metric: rouge_avg
 
 # Logging & Checkpointing
 # save_freq/eval_freq fraction-of-epoch; steps_per_epoch=12752 at global_batch_size=16,

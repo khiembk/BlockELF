@@ -224,10 +224,14 @@ def _run_block_generation(
                 if references is not None:
                     bleu_score = compute_bleu(hypotheses, references)
                     rouge_scores = compute_rouge(hypotheses, references)
-                    metrics_line.update({"bleu": bleu_score, **rouge_scores})
+                    rouge_avg = (
+                        rouge_scores["rouge1"] + rouge_scores["rouge2"] + rouge_scores["rougeL"]
+                    ) / 3.0
+                    metrics_line.update({"bleu": bleu_score, **rouge_scores, "rouge_avg": rouge_avg})
                     log_for_0(
                         f"BLEU: {bleu_score:.2f}  ROUGE-1: {rouge_scores['rouge1']:.2f}  "
-                        f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}"
+                        f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}  "
+                        f"ROUGE-avg: {rouge_avg:.2f}"
                     )
                     if sc_idx == 0:
                         # Which scored metric feeds best-checkpoint tracking --
@@ -236,8 +240,10 @@ def _run_block_generation(
                         # higher-is-better conditional-task metric"), but its VALUE is
                         # config.eval_primary_metric-driven: BLEU for WMT14 (default,
                         # unchanged), ROUGE for summarization tasks like XSum.
+                        # "rouge_avg" = mean(rouge1, rouge2, rougeL), a composite score
+                        # so a single criterion reflects all three rather than only one.
                         metric_name = getattr(config, "eval_primary_metric", "bleu")
-                        metric_values = {"bleu": bleu_score, **rouge_scores}
+                        metric_values = {"bleu": bleu_score, **rouge_scores, "rouge_avg": rouge_avg}
                         if metric_name not in metric_values:
                             raise ValueError(
                                 f"Unknown config.eval_primary_metric={metric_name!r}; "
