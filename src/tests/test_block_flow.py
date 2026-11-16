@@ -34,10 +34,14 @@ from utils.block_utils import (
 )
 from utils.data_utils import compute_block_round_counts
 from utils.encoder_utils import build_self_attn_cond_masks, encode_text
-from utils.generation_utils import pack_source_target_tight, extract_target_relative
+from utils.generation_utils import (
+    pack_source_target_tight, extract_target_relative,
+    generate_block_uncond, _generate_samples_single_batch,
+)
 from utils.train_utils import TrainState, create_learning_rate_fn
 from modules.model import ELF, ELFBlock
 from train_step import train_step
+from configs.config import SamplingConfig
 
 
 def test_sample_block_round_invariants():
@@ -716,6 +720,269 @@ def test_staggered_noise_finite_loss_and_trains_pos_embedder():
     print("[OK] use_staggered_noise=False creates no pos_t_embedder params (backward compatible)")
 
 
+class _FakeTokenizer:
+    """Minimal tokenizer stand-in for generate_block_uncond: only eos_token_id and
+    decode() are used along that code path."""
+    eos_token_id = 1
+
+    def decode(self, ids, skip_special_tokens=True):
+        del skip_special_tokens
+        return " ".join(str(int(i)) for i in ids)
+
+
+def _make_uncond_sampler_fixture(vocab_size=37, d_model=8, seq_len=16, depth=2, seed=0, warmup_steps=3):
+    """Builds a tiny ELF model + a few real (unconditional, cond_len=0) training steps.
+
+    FinalLayer's output kernel is zero-initialized (see modules/layers.py and the
+    identical caveat in _run_train_step above) -- at a freshly-initialized model this
+    makes net_out (and hence v_pred/x_pred) trivially constant regardless of input,
+    which would make any sampler-level attention-masking test pass vacuously (a false
+    pass, not a real invariance/sensitivity confirmation). A few real gradient steps
+    move FinalLayer's kernel away from zero so the sampler's output actually reflects
+    what the attention pattern does.
+    """
+    import optax
+
+    config = _Config()
+    config.max_length = seq_len
+    config.block_size = 4
+    config.pad_token = "eos"
+    config.use_block_revelation = True  # warmup must use the same path generation assumes
+    config.use_staggered_noise = False
+    model = ELF(
+        text_encoder_dim=d_model, max_length=seq_len, hidden_size=16, depth=depth, num_heads=2,
+        bottleneck_dim=4, num_time_tokens=2, num_self_cond_cfg_tokens=2, vocab_size=vocab_size,
+    )
+    rng = jax.random.PRNGKey(seed)
+    rng, init_rng, dropout_rng, data_rng, enc_rng = jax.random.split(rng, 5)
+    dummy_x = jnp.ones((1, seq_len, 2 * d_model))
+    params = model.init(
+        init_rng, x=dummy_x, t=jnp.ones((1,)), deterministic=True,
+        self_cond_cfg_scale=jnp.ones((1,)),
+    )["params"]
+
+    dummy_encoder = _make_dummy_encoder(vocab_size, d_model)
+    encoder_params = dummy_encoder.init(
+        enc_rng, input_ids=jnp.zeros((1, seq_len), dtype=jnp.int32),
+        attention_mask=jnp.ones((1, seq_len, seq_len)),
+    )["params"]
+    lr_fn = create_learning_rate_fn(num_train_steps=10, num_warmup_steps=0, learning_rate=1e-3)
+    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr_fn))
+    state = TrainState.create(
+        apply_fn=model.apply, params=params, tx=tx,
+        dropout_rng=dropout_rng, ema_params1=params,
+    )
+    batch = _make_batch(data_rng, batch_size=4, seq_len=seq_len, cond_len=0, vocab_size=vocab_size)
+    batch = {k: jnp.array(v) if isinstance(v, np.ndarray) else v for k, v in batch.items()}
+    batch = shard(batch)
+    encoder_params_r = jax_utils.replicate(encoder_params)
+    state_r = jax_utils.replicate(state)
+    p_train_step = jax.pmap(
+        lambda s, ep, b: train_step(s, ep, dummy_encoder.apply, b, config), axis_name="batch",
+    )
+    for _ in range(warmup_steps):
+        state_r, _ = p_train_step(state_r, encoder_params_r, batch)
+    trained_params = jax_utils.unreplicate(state_r).params
+    return config, model, trained_params, rng
+
+
+def test_uncond_sampler_round0_role_aware_matches_legacy():
+    """Mandatory test 3 (round-0 parity), precisely stated.
+
+    At round 0 (role_clean_mask all-False, nothing committed yet), CONTENT-to-CONTENT
+    attention is unrestricted in both legacy and role-aware modes -- an active query's
+    allowed keys are "all valid C \\cup A" (see the Query/Allowed-keys table), which
+    with C empty is just every valid content position, same as legacy's fully
+    unmasked attention.
+
+    This does NOT make the two modes bit-identical, though: `modules/model.py`'s
+    EXISTING, pre-existing (not changed by this task) role_clean_mask mechanism always
+    marks the model's own special/time tokens "clean" queries, which under role-aware
+    masking restricts them to attending only to other special/clean keys -- a
+    restriction legacy mode never applies (special tokens there attend to everything,
+    unrestricted). Since special-token hidden states feed into every later layer as
+    keys content queries attend to, this creates a small, real, EXPECTED difference in
+    the final content output -- not a bug, and not something this task's fix
+    introduces (train_step.py's training path already exhibits this exact behavior
+    whenever a batch's round k=0, so role-aware inference is actually MORE faithful to
+    training here, not less).
+
+    Confirmed directly: passing attention_mask=ones with role_clean_mask=None (i.e.
+    role masking not actually engaged) reproduces legacy EXACTLY; only switching
+    role_clean_mask from None to a real (all-False) array introduces the small
+    special-token-query-restriction difference. This test checks exactly that
+    decomposition, rather than asserting a too-strong "bit-identical" claim.
+    """
+    from utils.sampling_utils import get_sampling_steps
+
+    vocab_size, d_model, seq_len, batch_size = 37, 8, 16, 3
+    config, model, params, rng = _make_uncond_sampler_fixture(vocab_size, d_model, seq_len, seed=0)
+    sampling_config = SamplingConfig(
+        sampling_method="ode", num_sampling_steps=[8], cfgs=[1],
+        self_cond_cfg_scales=[1.0], time_schedule="uniform",
+    )
+    rng, z_rng, t_rng = jax.random.split(rng, 3)
+    z0 = jax.random.normal(z_rng, (batch_size, seq_len, d_model))
+    cond_seq = jnp.zeros((batch_size, seq_len, d_model))
+    cond_seq_mask = jnp.zeros((batch_size, seq_len))  # round 0: nothing committed yet
+    t_steps = get_sampling_steps(t_rng, n_steps=8, time_schedule="uniform")
+
+    common_kwargs = dict(
+        model_params=params, model_apply_fn=model.apply, rng=rng,
+        z=z0, t_steps=t_steps, cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        config=config, sampling_config=sampling_config, cfg_scale=1.0, self_cond_cfg_scale=1.0,
+    )
+    z_legacy = _generate_samples_single_batch(**common_kwargs)
+
+    # Validity mask alone, role masking NOT engaged (role_clean_mask=None) -- must
+    # reproduce legacy exactly, since model.py only ever consumes attention_mask
+    # inside the `if role_clean_mask is not None:` branch.
+    z_attn_only = _generate_samples_single_batch(
+        **common_kwargs, attention_mask=jnp.ones((batch_size, seq_len)), role_clean_mask=None,
+    )
+    assert jnp.allclose(z_legacy, z_attn_only, atol=1e-6), (
+        "attention_mask alone (role_clean_mask=None, i.e. role masking not engaged) "
+        "should be a pure no-op and exactly match legacy"
+    )
+
+    # Role masking actually engaged (role_clean_mask=all-False content): the ONLY
+    # difference vs legacy is the special-token-query restriction described above --
+    # small relative to the signal scale, not the large, structural difference a real
+    # content-to-content masking bug would cause (see the companion test below, which
+    # uses non-trivial committed content and expects a much larger difference).
+    z_role_aware = _generate_samples_single_batch(
+        **common_kwargs, attention_mask=jnp.ones((batch_size, seq_len)), role_clean_mask=cond_seq_mask,
+    )
+    diff = jnp.abs(z_legacy - z_role_aware)
+    scale = jnp.abs(z_legacy).mean() + 1e-8
+    assert float(diff.max()) / float(scale) < 1.0, (
+        "round-0 role-aware vs legacy difference is implausibly large relative to "
+        "signal scale for a special-token-only effect -- suspect a real content-to-"
+        "content masking bug, not just the expected special-token restriction"
+    )
+    print(
+        "[OK] uncond sampler round 0: content-to-content attention unrestricted in both "
+        f"modes (attn-only-no-op diff={float(jnp.abs(z_legacy - z_attn_only).max()):.2e}); "
+        f"role-aware vs legacy differs only via the special-token restriction "
+        f"(max diff={float(diff.max()):.4f}, relative to scale={float(scale):.4f})"
+    )
+
+
+def test_uncond_sampler_role_aware_changes_output_with_committed_context():
+    """Complements the round-0 test: once SOME positions are actually committed,
+    role-aware masking must produce a numerically DIFFERENT active-region prediction
+    than the legacy (fully bidirectional, committed queries see active keys too) path
+    -- confirming the new attention_mask/role_clean_mask wiring is not a silent no-op.
+    (The deeper correctness guarantee -- that committed/special hidden states are
+    truly invariant to active-region content at every layer -- is already covered at
+    the model level by test_fix_c_no_active_leak_into_clean_hidden_states; z_final at
+    committed positions can't distinguish the two modes on its own since
+    `restore_vx` always forces v=0 there regardless of attention masking.)
+    """
+    from utils.sampling_utils import get_sampling_steps
+
+    vocab_size, d_model, seq_len, batch_size = 37, 8, 16, 2
+    config, model, params, rng = _make_uncond_sampler_fixture(vocab_size, d_model, seq_len, seed=1)
+    sampling_config = SamplingConfig(
+        sampling_method="ode", num_sampling_steps=[6], cfgs=[1],
+        self_cond_cfg_scales=[1.0], time_schedule="uniform",
+    )
+    committed_len = 6
+    pos = np.arange(seq_len)
+    is_committed = pos < committed_len
+    cond_seq_mask = jnp.array(np.tile(is_committed, (batch_size, 1)).astype(np.float32))
+    active_idx = np.where(~is_committed)[0]
+
+    rng, cond_rng, z_rng, t_rng = jax.random.split(rng, 4)
+    cond_seq = jax.random.normal(cond_rng, (batch_size, seq_len, d_model))
+    z0 = jax.random.normal(z_rng, (batch_size, seq_len, d_model))
+    t_steps = get_sampling_steps(t_rng, n_steps=6, time_schedule="uniform")
+
+    common_kwargs = dict(
+        model_params=params, model_apply_fn=model.apply, rng=rng,
+        z=z0, t_steps=t_steps, cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+        config=config, sampling_config=sampling_config, cfg_scale=1.0, self_cond_cfg_scale=1.0,
+    )
+    z_legacy = _generate_samples_single_batch(**common_kwargs)
+    z_role_aware = _generate_samples_single_batch(
+        **common_kwargs,
+        attention_mask=jnp.ones((batch_size, seq_len)),
+        role_clean_mask=cond_seq_mask,
+    )
+    assert not jnp.allclose(z_legacy[:, active_idx], z_role_aware[:, active_idx], atol=1e-5), (
+        "role-aware masking had no effect on active-region output despite non-trivial "
+        "committed content -- the attention_mask/role_clean_mask wiring looks like a no-op"
+    )
+    print("[OK] uncond sampler: role-aware masking measurably changes active-region output "
+          "once committed content exists (confirms the wiring is live, not a no-op)")
+
+
+def test_generate_block_uncond_role_aware_flag():
+    """Mandatory test 6 (legacy regression) + a functional smoke test of the new
+    use_role_aware_attention=True path, both through the full generate_block_uncond
+    entry point (not just the lower-level sampler)."""
+    vocab_size, d_model, seq_len, batch_size = 37, 8, 16, 2
+    config, model, params, rng = _make_uncond_sampler_fixture(vocab_size, d_model, seq_len, seed=2)
+    dummy_encoder = _make_dummy_encoder(vocab_size, d_model)
+    rng, enc_rng, dropout_rng = jax.random.split(rng, 3)
+    encoder_params = dummy_encoder.init(
+        enc_rng, input_ids=jnp.zeros((1, seq_len), dtype=jnp.int32),
+        attention_mask=jnp.ones((1, seq_len, seq_len)),
+    )["params"]
+    import optax
+    tx = optax.sgd(1e-3)
+    state = TrainState.create(
+        apply_fn=model.apply, params=params, tx=tx,
+        dropout_rng=dropout_rng, ema_params1=params,
+    )
+    sampling_config = SamplingConfig(
+        sampling_method="ode", num_sampling_steps=[4], cfgs=[1],
+        self_cond_cfg_scales=[1.0], time_schedule="uniform",
+    )
+    tokenizer = _FakeTokenizer()
+
+    def run(use_role_aware, seed):
+        return generate_block_uncond(
+            state=state, encoder_params=encoder_params, encoder_apply_fn=dummy_encoder.apply,
+            tokenizer=tokenizer, config=config, sampling_config=sampling_config,
+            batch_size=batch_size, rng=jax.random.PRNGKey(seed),
+            use_role_aware_attention=use_role_aware,
+        )
+
+    # Legacy regression: flag off (the default) must be deterministic / unchanged
+    # across repeated calls with the same seed.
+    legacy_a = run(use_role_aware=False, seed=123)
+    legacy_b = run(use_role_aware=False, seed=123)
+    assert legacy_a == legacy_b, "legacy (use_role_aware_attention=False) path is not deterministic"
+    print("[OK] generate_block_uncond: legacy path (flag off) deterministic for a fixed seed")
+
+    # New path: must run end-to-end without error and produce the right structure.
+    role_aware_out = run(use_role_aware=True, seed=123)
+    assert len(role_aware_out) == batch_size
+    assert all(isinstance(t, str) for t in role_aware_out)
+    print("[OK] generate_block_uncond: use_role_aware_attention=True runs end-to-end "
+          f"and returns {batch_size} decoded strings")
+
+    # Guard-rail: must refuse on a checkpoint/config not actually trained this way.
+    bad_config = _Config()
+    bad_config.max_length = seq_len
+    bad_config.use_block_revelation = False
+    try:
+        generate_block_uncond(
+            state=state, encoder_params=encoder_params, encoder_apply_fn=dummy_encoder.apply,
+            tokenizer=tokenizer, config=bad_config, sampling_config=sampling_config,
+            batch_size=batch_size, rng=jax.random.PRNGKey(0), use_role_aware_attention=True,
+        )
+        raised = False
+    except AssertionError:
+        raised = True
+    assert raised, (
+        "use_role_aware_attention=True should refuse (assert) on a non-block-revelation config"
+    )
+    print("[OK] generate_block_uncond: use_role_aware_attention=True correctly refuses "
+          "on a config not trained with use_block_revelation=True")
+
+
 def test_round_count_reweighting_fixes_bias():
     rng = np.random.default_rng(0)
     n = 20000
@@ -765,5 +1032,8 @@ if __name__ == "__main__":
     test_fix_c_padding_excluded_from_attention_keys()
     test_staggered_timesteps_schedule_shape()
     test_staggered_noise_finite_loss_and_trains_pos_embedder()
+    test_uncond_sampler_round0_role_aware_matches_legacy()
+    test_uncond_sampler_role_aware_changes_output_with_committed_context()
+    test_generate_block_uncond_role_aware_flag()
     test_round_count_reweighting_fixes_bias()
     print("\nAll block-flow sanity tests passed.")
