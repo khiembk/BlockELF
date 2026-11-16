@@ -132,31 +132,6 @@ def train_step(
         latent_std=latent_std,
     )
 
-    # Committed-context corruption (opt-in, conditional-generation-only -- see
-    # config.committed_corrupt_prob's docstring in configs/config.py). Perturbs the
-    # committed TARGET's clean embedding only (never source, never the active/
-    # supervised region) with small per-example Gaussian noise, simulating the
-    # imperfect self-generated context inference actually faces (vs. training's
-    # always-true committed prefix) -- an exposure-bias mitigation. Safe w.r.t. the
-    # loss: loss_mask (= active_mask_2d) already excludes committed positions
-    # entirely, so this never touches the regression target at supervised positions.
-    # Defaults to a no-op (committed_corrupt_prob=0.0) for every existing config.
-    if (
-        config.use_block_revelation and not config.use_staggered_noise
-        and config.committed_corrupt_prob > 0
-    ):
-        corrupt_select_rng = jax.random.fold_in(block_rng, 1)
-        corrupt_noise_rng = jax.random.fold_in(block_rng, 2)
-        corrupt_this_example = (
-            jax.random.uniform(corrupt_select_rng, (batch_size, 1, 1)) < config.committed_corrupt_prob
-        )
-        corrupt_noise = (
-            jax.random.normal(corrupt_noise_rng, x0.shape, dtype=x0.dtype)
-            * config.committed_corrupt_noise_scale
-        )
-        committed_only_mask = committed_mask_2d[:, :, None] * corrupt_this_example.astype(x0.dtype)
-        x0 = jnp.where(committed_only_mask > 0, x0 + corrupt_noise, x0)
-
     t = sample_timesteps(
         t_rng, batch_size,
         P_mean=config.denoiser_p_mean, P_std=config.denoiser_p_std,

@@ -76,24 +76,6 @@ class Config:
     # intensity knob to tune.
     use_staggered_noise: bool = False
 
-    # Committed-context corruption -- an opt-in, conditional-generation-only exposure-
-    # bias mitigation (see gpt/conditional_gen_fix.md and the WMT14 peak-then-plateau
-    # investigation it prompted). Only applies in the discrete (non-staggered)
-    # block-revelation path; defaults to 0.0 (no corruption, byte-identical to prior
-    # behavior) for every existing config, including the unconditional (OWT/LM1B)
-    # ones -- only the WMT14 conditional config enables it.
-    #
-    # Training always teacher-forces the TRUE committed target prefix, but inference
-    # commits the model's OWN (possibly imperfect) prior-round predictions instead --
-    # a train/inference mismatch (exposure bias) that gets worse the more tightly the
-    # model specializes to the training distribution. Perturbing the committed
-    # target's clean embedding (not source, and never the active/supervised region)
-    # with small Gaussian noise during training simulates "slightly-imperfect
-    # committed context," teaching robustness to self-generated prefixes without the
-    # cost of a full scheduled-sampling (real generation-in-the-loop) setup.
-    committed_corrupt_prob: float = 0.0  # per-example probability of corrupting this step
-    committed_corrupt_noise_scale: float = 0.0  # std of the injected Gaussian noise
-
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch

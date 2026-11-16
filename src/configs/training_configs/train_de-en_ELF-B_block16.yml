@@ -45,20 +45,6 @@ decoder_p_std: 0.8
 label_drop_prob: 0.1
 self_cond_prob: 0.5
 
-# Committed-context corruption (opt-in, conditional-only -- see config.py's docstring):
-# the prior run's BLEU peaked early (step 6000, BLEU 10.26) then declined and
-# plateaued around BLEU~5.2-5.6 from step 20000 through 94000+ (75k steps, no
-# recovery) -- training loss plateaued at the same point, confirming the model
-# converges to a genuinely different, stable optimum under the teacher-forced
-# objective, one that's worse for real (self-generated-prefix) inference than the
-# transient state it passed through early on. This perturbs the committed target's
-# clean context with Gaussian noise 30% of the time, simulating the imperfect
-# self-generated prefix inference actually sees, to reduce that train/inference
-# mismatch. latent_std=0.2 above, so noise_scale=0.1 is a moderate (50%-of-std)
-# perturbation -- not yet ablated against other scales.
-committed_corrupt_prob: 0.3
-committed_corrupt_noise_scale: 0.1
-
 # Training (optimizer + schedule) — originally scaled for 2x A40 (~27GB/GPU target,
 # global_batch_size=64); re-tuned for 2x H100 (80GB). global_batch_size=256 measured
 # ~40GB/38GB per GPU; 512 OOM'd immediately (tried to allocate ~67GB in a single op,
@@ -76,16 +62,9 @@ committed_corrupt_noise_scale: 0.1
 # (conditional_gen_fix.md). A much gentler fine-tuning LR should let the model adapt to
 # the new block-revelation objective without this catastrophic-forgetting-style
 # collapse of its already-strong warm-started translation ability.
-# epochs cut from 20 -> 3 and lr_schedule switched constant -> cosine: the prior run's
-# useful signal was entirely within step 6000-20000 (well under 2 of the original 20
-# epochs, steps_per_epoch=11741) before plateauing for 75k+ more steps at constant
-# lr=1.5e-4. A cosine decay over a much shorter 3-epoch (35223-step) budget should let
-# the model settle near the early-peak region instead of a sustained full-strength LR
-# pushing it past into the worse, plateaued optimum.
-epochs: 3
+epochs: 20
 global_batch_size: 384
 blr: 0.0001
-lr_schedule: cosine
 weight_decay: 0.0
 warmup_steps: 500
 optimizer: muon
