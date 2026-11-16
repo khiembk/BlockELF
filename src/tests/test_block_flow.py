@@ -917,10 +917,12 @@ def test_uncond_sampler_role_aware_changes_output_with_committed_context():
           "once committed content exists (confirms the wiring is live, not a no-op)")
 
 
-def test_generate_block_uncond_role_aware_flag():
-    """Mandatory test 6 (legacy regression) + a functional smoke test of the new
-    use_role_aware_attention=True path, both through the full generate_block_uncond
-    entry point (not just the lower-level sampler)."""
+def test_generate_block_uncond_role_aware_default():
+    """Role-aware attention is now the unconditional default (no opt-in flag): confirms
+    `generate_block_uncond` runs end-to-end deterministically for a fixed seed on an
+    eligible (use_block_revelation=True, use_staggered_noise=False) checkpoint, and that
+    a staggered-noise checkpoint -- where the role_clean_mask semantics don't apply --
+    falls back automatically to the legacy unmasked path instead of erroring."""
     vocab_size, d_model, seq_len, batch_size = 37, 8, 16, 2
     config, model, params, rng = _make_uncond_sampler_fixture(vocab_size, d_model, seq_len, seed=2)
     dummy_encoder = _make_dummy_encoder(vocab_size, d_model)
@@ -941,46 +943,36 @@ def test_generate_block_uncond_role_aware_flag():
     )
     tokenizer = _FakeTokenizer()
 
-    def run(use_role_aware, seed):
+    def run(cfg, seed):
         return generate_block_uncond(
             state=state, encoder_params=encoder_params, encoder_apply_fn=dummy_encoder.apply,
-            tokenizer=tokenizer, config=config, sampling_config=sampling_config,
+            tokenizer=tokenizer, config=cfg, sampling_config=sampling_config,
             batch_size=batch_size, rng=jax.random.PRNGKey(seed),
-            use_role_aware_attention=use_role_aware,
         )
 
-    # Legacy regression: flag off (the default) must be deterministic / unchanged
-    # across repeated calls with the same seed.
-    legacy_a = run(use_role_aware=False, seed=123)
-    legacy_b = run(use_role_aware=False, seed=123)
-    assert legacy_a == legacy_b, "legacy (use_role_aware_attention=False) path is not deterministic"
-    print("[OK] generate_block_uncond: legacy path (flag off) deterministic for a fixed seed")
+    # Default (eligible checkpoint): role-aware attention applied, deterministic for a
+    # fixed seed, runs end-to-end without error.
+    role_aware_a = run(config, seed=123)
+    role_aware_b = run(config, seed=123)
+    assert role_aware_a == role_aware_b, "role-aware (default) path is not deterministic"
+    assert len(role_aware_a) == batch_size
+    assert all(isinstance(t, str) for t in role_aware_a)
+    print("[OK] generate_block_uncond: role-aware attention is the default, deterministic "
+          f"for a fixed seed, and returns {batch_size} decoded strings")
 
-    # New path: must run end-to-end without error and produce the right structure.
-    role_aware_out = run(use_role_aware=True, seed=123)
-    assert len(role_aware_out) == batch_size
-    assert all(isinstance(t, str) for t in role_aware_out)
-    print("[OK] generate_block_uncond: use_role_aware_attention=True runs end-to-end "
-          f"and returns {batch_size} decoded strings")
-
-    # Guard-rail: must refuse on a checkpoint/config not actually trained this way.
-    bad_config = _Config()
-    bad_config.max_length = seq_len
-    bad_config.use_block_revelation = False
-    try:
-        generate_block_uncond(
-            state=state, encoder_params=encoder_params, encoder_apply_fn=dummy_encoder.apply,
-            tokenizer=tokenizer, config=bad_config, sampling_config=sampling_config,
-            batch_size=batch_size, rng=jax.random.PRNGKey(0), use_role_aware_attention=True,
-        )
-        raised = False
-    except AssertionError:
-        raised = True
-    assert raised, (
-        "use_role_aware_attention=True should refuse (assert) on a non-block-revelation config"
-    )
-    print("[OK] generate_block_uncond: use_role_aware_attention=True correctly refuses "
-          "on a config not trained with use_block_revelation=True")
+    # Staggered-noise checkpoint: role_clean_mask semantics don't apply -- must fall back
+    # to legacy unmasked attention automatically, not raise.
+    staggered_config = _Config()
+    staggered_config.max_length = seq_len
+    staggered_config.block_size = config.block_size
+    staggered_config.pad_token = "eos"
+    staggered_config.use_block_revelation = True
+    staggered_config.use_staggered_noise = True
+    staggered_out = run(staggered_config, seed=123)
+    assert len(staggered_out) == batch_size
+    assert all(isinstance(t, str) for t in staggered_out)
+    print("[OK] generate_block_uncond: use_staggered_noise=True falls back to legacy "
+          "unmasked attention automatically (no error)")
 
 
 def test_round_count_reweighting_fixes_bias():
@@ -1034,6 +1026,6 @@ if __name__ == "__main__":
     test_staggered_noise_finite_loss_and_trains_pos_embedder()
     test_uncond_sampler_round0_role_aware_matches_legacy()
     test_uncond_sampler_role_aware_changes_output_with_committed_context()
-    test_generate_block_uncond_role_aware_flag()
+    test_generate_block_uncond_role_aware_default()
     test_round_count_reweighting_fixes_bias()
     print("\nAll block-flow sanity tests passed.")

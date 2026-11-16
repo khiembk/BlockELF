@@ -60,13 +60,6 @@ def parse_args():
     p.add_argument("--print_examples", type=int, default=5)
     p.add_argument("--out_path", type=str, default=None,
                     help="Optional path to write generated samples as JSONL.")
-    p.add_argument("--role_aware_attention", action="store_true", default=False,
-                    help="Opt-in, default-off inference-only fix: thread the same "
-                         "role_clean_mask / validity attention_mask train_step.py already "
-                         "uses (fixed-block, non-staggered checkpoints only) through "
-                         "generate_block_uncond's sampler, instead of the legacy fully "
-                         "unmasked attention. For A/B comparison against the legacy path "
-                         "(flag absent) on the SAME checkpoint/seed.")
     return p.parse_args()
 
 
@@ -84,7 +77,8 @@ def main():
     log_for_0(f"Checkpoint: {args.checkpoint_path}")
     log_for_0(f"block_size={config.block_size}, use_block_revelation={config.use_block_revelation}")
     log_for_0(f"sampling_config={sampling_config}")
-    log_for_0(f"role_aware_attention={args.role_aware_attention}")
+    log_for_0(f"role_aware_attention (auto): "
+              f"{config.use_block_revelation and not config.use_staggered_noise}")
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or config.encoder_model_name)
 
@@ -140,7 +134,6 @@ def main():
             state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
             tokenizer=tokenizer, config=config, sampling_config=sampling_config,
             batch_size=cur_batch, rng=gen_rng,
-            use_role_aware_attention=args.role_aware_attention,
         )
         hypotheses.extend(texts)
         samples_done += len(texts)

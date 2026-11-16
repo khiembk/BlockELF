@@ -435,7 +435,6 @@ def generate_block_uncond(
     batch_size: int,
     rng: PRNGKey,
     use_ema: bool = True,
-    use_role_aware_attention: bool = False,
 ):
     """Block-to-block unconditional generation (single device, eager Python loop).
 
@@ -450,32 +449,26 @@ def generate_block_uncond(
     baseline — see docs/main.tex Sec. 6). Not pmapped: a smoke-test / qualitative-eval
     utility, not a production multi-device eval path.
 
-    use_role_aware_attention: opt-in, default-off inference-only fix (see
-    gpt/... investigation and `test_fix_c_*` in tests/test_block_flow.py for the
-    underlying model-level masking this mirrors). `train_step.py`'s fixed-block,
-    non-staggered path already trains the denoiser with a role_clean_mask (committed
-    queries never attend active keys) and a validity attention_mask -- but this
-    function's sampling call never passed either, so inference silently ran with fully
-    unmasked attention regardless of what training taught the model to expect (the same
-    class of train/inference mismatch already fixed for the CONDITIONAL path in
-    `generate_block_cond`). When enabled, `role_clean_mask` is set to this round's
+    Role-aware attention (committed queries restricted to committed-only keys, matching
+    `train_step.py`'s fixed-block, non-staggered denoiser objective) is applied
+    whenever the checkpoint supports it (`use_block_revelation=True`,
+    `use_staggered_noise=False`) -- this used to be an opt-in flag defaulting to the old
+    fully-unmasked behavior, but an A/B comparison against real pretrained checkpoints
+    (OWT, LM1B) confirmed it strictly improves generation quality (e.g. LM1B Gen. PPL
+    55.89 -> 38.16 at 1000 samples, 64 sampling steps) with no regressions, so it is now
+    always applied for eligible checkpoints. `role_clean_mask` is set to this round's
     committed-position mask and `attention_mask` to an all-valid mask (every position in
     the unconditional canvas is either committed or active -- there is no separate
     "beyond the canvas" padding region here, unlike the conditional task's variable
-    source length). Only meaningful for checkpoints actually trained with
-    `use_block_revelation=True, use_staggered_noise=False`; asserted below. Default
-    False preserves the exact prior (fully unmasked) behavior for every existing caller.
+    source length). For checkpoints where this doesn't apply (`use_staggered_noise=True`,
+    whose role_clean_mask semantics differ), generation falls back automatically to the
+    legacy fully-unmasked attention -- this is the correct behavior for that training
+    regime, not a bug.
 
     Returns:
         List of `batch_size` decoded strings (special tokens stripped).
     """
-    if use_role_aware_attention:
-        assert config.use_block_revelation and not config.use_staggered_noise, (
-            "use_role_aware_attention requires a checkpoint trained with "
-            "use_block_revelation=True and use_staggered_noise=False -- the role_clean_mask "
-            "semantics it relies on don't apply to legacy non-block or staggered-noise "
-            "training."
-        )
+    use_role_aware = config.use_block_revelation and not config.use_staggered_noise
     pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
     eos_token_id = tokenizer.eos_token_id
     block_size = config.block_size
@@ -518,7 +511,7 @@ def generate_block_uncond(
             P_mean=config.denoiser_p_mean, P_std=config.denoiser_p_std,
         )
         extra_sampler_kwargs = {}
-        if use_role_aware_attention:
+        if use_role_aware:
             # Every position in the unconditional canvas is either committed or active
             # -- unlike the conditional task's `target_capacity`, there's no separate
             # "beyond the real content" padding region here, so the validity mask is
