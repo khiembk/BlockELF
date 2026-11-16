@@ -78,7 +78,7 @@ def main():
     log_for_0(f"block_size={config.block_size}, use_block_revelation={config.use_block_revelation}")
     log_for_0(f"sampling_config={sampling_config}")
     log_for_0(f"role_aware_attention (auto): "
-              f"{config.use_block_revelation and not config.use_staggered_noise}")
+              f"{config.use_block_revelation and not config.use_staggered_noise and getattr(config, 'role_aware_uncond_attention', True)}")
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or config.encoder_model_name)
 

@@ -14,6 +14,7 @@ Covers:
      weighted scheme, where the naive uniform-per-example scheme is biased toward short
      examples (see train.py's `sample_weights` wiring and data_utils.py docstring).
 """
+import copy
 import os
 import sys
 
@@ -163,6 +164,7 @@ class _Config:
     use_block_revelation = False
     block_size = 4
     use_staggered_noise = False
+    role_aware_uncond_attention = True
     max_length = 20
     max_input_length = None
 
@@ -973,6 +975,22 @@ def test_generate_block_uncond_role_aware_default():
     assert all(isinstance(t, str) for t in staggered_out)
     print("[OK] generate_block_uncond: use_staggered_noise=True falls back to legacy "
           "unmasked attention automatically (no error)")
+
+    # Config-level opt-out (the OWT-style override): role_aware_uncond_attention=False
+    # on an otherwise-eligible config must take effect -- i.e. change the generated
+    # output relative to the role-aware default, since the two modes diverge once
+    # committed context is non-trivial (see test_uncond_sampler_role_aware_changes_
+    # output_with_committed_context for the lower-level confirmation this isn't a no-op).
+    opt_out_config = copy.deepcopy(config)
+    opt_out_config.role_aware_uncond_attention = False
+    opt_out_out = run(opt_out_config, seed=123)
+    assert len(opt_out_out) == batch_size
+    assert opt_out_out != role_aware_a, (
+        "role_aware_uncond_attention=False had no effect on output -- the config-level "
+        "opt-out (used by OWT) looks like a no-op"
+    )
+    print("[OK] generate_block_uncond: role_aware_uncond_attention=False (config opt-out) "
+          "measurably changes output relative to the role-aware default")
 
 
 def test_round_count_reweighting_fixes_bias():

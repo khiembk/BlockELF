@@ -76,6 +76,21 @@ class Config:
     # intensity knob to tune.
     use_staggered_noise: bool = False
 
+    # Unconditional block-to-block inference: role-aware attention (committed queries
+    # restricted to committed-only keys, matching train_step.py's training objective)
+    # vs the original fully-unmasked attention. Default True (the fix) since an A/B
+    # comparison against real pretrained checkpoints showed a clean win on LM1B (Gen.
+    # PPL 55.89 -> 38.16 @ 64 steps, repetition rate roughly unchanged). On OWT
+    # (max_length=1024, 64 commit rounds), however, role-aware attention was found to
+    # *increase* repetition-loop collapse (seq-rep-4 0.37 -> 0.61, 32.5% -> 72.5% of
+    # samples heavily looping) despite a lower Gen. PPL -- that metric improvement is an
+    # artifact of GPT-2 scoring repeated text as highly predictable, not a real quality
+    # gain. Set to False in OWT's config to keep the pre-fix (legacy) behavior there
+    # until the long-canvas regression is understood. Only read by
+    # generate_block_uncond; ignored when use_block_revelation=False or
+    # use_staggered_noise=True (role-aware semantics don't apply either way).
+    role_aware_uncond_attention: bool = True
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch

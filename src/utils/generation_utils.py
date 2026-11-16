@@ -450,25 +450,32 @@ def generate_block_uncond(
     utility, not a production multi-device eval path.
 
     Role-aware attention (committed queries restricted to committed-only keys, matching
-    `train_step.py`'s fixed-block, non-staggered denoiser objective) is applied
-    whenever the checkpoint supports it (`use_block_revelation=True`,
-    `use_staggered_noise=False`) -- this used to be an opt-in flag defaulting to the old
-    fully-unmasked behavior, but an A/B comparison against real pretrained checkpoints
-    (OWT, LM1B) confirmed it strictly improves generation quality (e.g. LM1B Gen. PPL
-    55.89 -> 38.16 at 1000 samples, 64 sampling steps) with no regressions, so it is now
-    always applied for eligible checkpoints. `role_clean_mask` is set to this round's
-    committed-position mask and `attention_mask` to an all-valid mask (every position in
-    the unconditional canvas is either committed or active -- there is no separate
-    "beyond the canvas" padding region here, unlike the conditional task's variable
-    source length). For checkpoints where this doesn't apply (`use_staggered_noise=True`,
-    whose role_clean_mask semantics differ), generation falls back automatically to the
-    legacy fully-unmasked attention -- this is the correct behavior for that training
-    regime, not a bug.
+    `train_step.py`'s fixed-block, non-staggered denoiser objective) is applied whenever
+    the checkpoint supports it (`use_block_revelation=True`, `use_staggered_noise=False`)
+    AND `config.role_aware_uncond_attention` is True (the default). An A/B comparison
+    against real pretrained checkpoints confirmed a clean win on LM1B (Gen. PPL 55.89 ->
+    38.16 at 1000 samples, 64 sampling steps, repetition rate essentially unchanged) --
+    but on OWT (max_length=1024, 64 commit rounds), role-aware attention was found to
+    *increase* repetition-loop collapse despite a lower Gen. PPL (that PPL drop is a
+    known GPT-2-scoring artifact of repeated text, not real quality), so OWT's own
+    config sets `role_aware_uncond_attention: false` to keep the legacy (fully-unmasked)
+    behavior there until the long-canvas regression is understood. When enabled,
+    `role_clean_mask` is set to this round's committed-position mask and
+    `attention_mask` to an all-valid mask (every position in the unconditional canvas is
+    either committed or active -- there is no separate "beyond the canvas" padding
+    region here, unlike the conditional task's variable source length).
+    `use_staggered_noise=True` checkpoints always fall back to legacy attention
+    regardless of the config flag, since the role_clean_mask semantics it relies on
+    don't apply to that training regime.
 
     Returns:
         List of `batch_size` decoded strings (special tokens stripped).
     """
-    use_role_aware = config.use_block_revelation and not config.use_staggered_noise
+    use_role_aware = (
+        config.use_block_revelation
+        and not config.use_staggered_noise
+        and getattr(config, "role_aware_uncond_attention", True)
+    )
     pad_token_id = get_pad_token_id(tokenizer, config.pad_token)
     eos_token_id = tokenizer.eos_token_id
     block_size = config.block_size

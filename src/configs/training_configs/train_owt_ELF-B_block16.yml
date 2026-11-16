@@ -99,6 +99,17 @@ log_freq: 50
 save_freq: 0.004930
 eval_freq: 0.024648
 
+# Inference-only: keep the legacy (fully-unmasked) attention path in
+# generate_block_uncond, not the newer role-aware default. A/B comparison on this
+# task's pretrained checkpoint (owt_146k/checkpoint_146075, 200 samples, seed 42) found
+# role-aware attention increases repetition-loop collapse at this canvas length
+# (max_length=1024, 64 commit rounds): seq-rep-4 0.369 -> 0.615, samples heavily looping
+# 32.5% -> 72.5%. Its lower Gen. PPL (9.57 -> 4.07) is a GPT-2-scoring artifact of that
+# repeated text being highly predictable, not a real quality improvement. LM1B's
+# shorter canvas (max_length=128, 8 commit rounds) showed no such regression, so it
+# keeps the new default (see configs/config.py's role_aware_uncond_attention docstring).
+role_aware_uncond_attention: false
+
 # Output
 output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-owt-block16"
 hf_repo_id: null
