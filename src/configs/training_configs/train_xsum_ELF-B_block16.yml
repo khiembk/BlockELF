@@ -1,0 +1,121 @@
+# Phase 1: block-to-block (fixed-commitment) revelation, XSum summarization, commit
+# size b=16. Same task/encoder/architecture as train_xsum_ELF-B.yml; only the denoiser
+# training objective changes (teacher-forced committed prefix + active-only
+# noise/loss -- see utils/block_utils.py and train_step.py), matching
+# train_de-en_ELF-B_block16.yml's approach for WMT14.
+#
+# Canvas shape: max_length=1088, max_input_length=1024 -> target_capacity =
+# max_length - max_input_length = 64 (same target budget as WMT14's block16 config, so
+# the same 4 commit rounds of block_size=16), but the COMBINED canvas (source document
+# up to 1024 tokens + summary target) is ~8.5x longer than WMT14's 128 -- comparable in
+# scale to OWT's unconditional max_length=1024. Attention cost per round is therefore
+# much closer to OWT's per-round cost than to WMT14's, even though there are only 4
+# rounds (vs OWT's 64) -- batch size below is scaled down accordingly from WMT14's 384
+# and needs its own OOM-driven smoke test on this shared 2xH100 node before a real
+# launch, same discipline as every other block16 config here.
+#
+# blr reduced 10x up front (0.001 -> 0.0001), pre-empting the catastrophic-forgetting
+# collapse WMT14's block16 warm-start hit at blr=0.001 (BLEU 31.35 -> 3.93 over 30k
+# steps) rather than rediscovering it the hard way -- same gentler fine-tuning-LR
+# argument applies here: a pretrained, already-strong XSum checkpoint is being adapted
+# to a new (block-revelation) training objective, not trained from scratch.
+
+# Dataset
+data_path: "embedded-language-flows/xsum_train_t5"
+eval_data_path: "embedded-language-flows/xsum_validation_t5"
+max_length: 1088
+max_input_length: 1024
+pad_token: eos
+
+# Encoder
+encoder_model_name: t5-small
+encoder_checkpoint: "embedded-language-flows/t5_small_encoder_jax/t5_small_encoder_jax.pkl"
+latent_mean: 0.0
+latent_std: 0.2
+
+# Model architecture
+model: ELF-B  # ELF-B, ELF-M
+bottleneck_dim: 128
+num_time_tokens: 4
+num_self_cond_cfg_tokens: 4
+num_model_mode_tokens: 4
+
+# Denoiser objective
+denoiser_p_mean: -1.5
+denoiser_p_std: 0.8
+denoiser_noise_scale: 2.0
+t_eps: 0.05
+time_schedule: "logit_normal"
+
+# Block-to-block (fixed-commitment) revelation — Adaptive BlockFlow Stage 1
+use_block_revelation: true
+block_size: 16
+
+# Decoder objective
+decoder_prob: 0.2
+decoder_noise_scale: 1.0
+decoder_p_mean: 0.8
+decoder_p_std: 0.8
+
+# Conditioning / CFG
+label_drop_prob: 0.1
+self_cond_prob: 0.5
+
+# Training (optimizer + schedule) — conservative initial placeholder, mirroring
+# train_owt_ELF-B_block16.yml's scaling (same order-of-magnitude combined canvas
+# length, ~1024-1088). NOT yet smoke-tested on this exact config -- verify no OOM
+# (XLA_PYTHON_CLIENT_PREALLOCATE=false) before a real launch, same as every other
+# block16 config here. dataset has 204045 rows -> steps_per_epoch = 204045 // 16 =
+# 12752 at this global_batch_size.
+epochs: 20
+global_batch_size: 16
+grad_accum_steps: 8  # effective batch 128
+blr: 0.0001
+weight_decay: 0.0
+warmup_steps: 500
+optimizer: muon
+
+# EMA
+ema_decay1: 0.9999
+
+# Sampling
+sampling_configs_path: "configs/sampling_configs/cond_sampling_configs.yml"
+num_samples: 64
+
+# Best-checkpoint tracking: ROUGE (not BLEU) is the standard metric for abstractive
+# summarization -- best-checkpoint selection should track ROUGE-L, not translation-style
+# BLEU (see configs/config.py's eval_primary_metric docstring). BLEU/ROUGE-1/ROUGE-2 are
+# still computed and logged every eval regardless; this only changes which one gates
+# "New best checkpoint" saves.
+eval_primary_metric: rougeL
+
+# Logging & Checkpointing
+# save_freq/eval_freq fraction-of-epoch; steps_per_epoch=12752 at global_batch_size=16,
+# so 2000 / 12752 ≈ 0.156827 saves/evals roughly every ~2000 steps -- matched cadence
+# (unlike OWT, where eval was far slower than save) since XSum's eval has only 4
+# commit rounds/sample (vs OWT's 64), so a full eval round should be much cheaper
+# despite the similar combined canvas length.
+log_freq: 10
+save_freq: 0.156827
+eval_freq: 0.156827
+
+# Output
+output_dir: "/scratch/khiem.tran@ad.wsu.edu/elf_block/outputs/elf_b-xsum-block16"
+hf_repo_id: null
+resume: null
+# Warm-start from the existing pretrained (non-block-revelation) ELF-B XSum checkpoint,
+# same approach as WMT14/OWT's warm-start. Verified genuinely trained: step=39800,
+# epoch=100 (matches train_xsum_ELF-B.yml's epochs=100), non-trivial param norms, not a
+# random-init artifact. Same architecture as this block16 config (ELF-B,
+# bottleneck_dim=128, num_time_tokens=4, etc.), so only params/ema_params1 are loaded;
+# step/epoch/opt_state stay fresh.
+warm_start_checkpoint: "/home.na1/ad.wsu.edu/khiem.tran/pvt/checkpoints/ELF-B-xsum/checkpoint_0"
+
+# Wandb
+use_wandb: false
+wandb_project: elf
+wandb_entity:
+wandb_run_name: elf_b-xsum-block16
+
+# Misc
+seed: 42

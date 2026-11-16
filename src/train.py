@@ -116,16 +116,20 @@ def _seed_best_ppl(config):
 
 
 def _seed_best_bleu(config):
-    """Best-so-far BLEU (higher is better) from `sampling_configs[0]`'s existing
-    `metrics.jsonl`, for conditional (reference-available) tasks -- the BLEU-scored
-    counterpart of `_seed_best_ppl`. Unlike Gen. PPL, BLEU is directly computed against
-    ground-truth references, so degenerate/empty output can't score artificially high
-    (it scores ~0) -- no plausibility filter is needed here. Returns -inf if not
-    applicable (no block mode, no prior history, online_eval off, or no "bleu" field
-    recorded -- i.e. this is an unconditional task).
+    """Best-so-far score (higher is better) from `sampling_configs[0]`'s existing
+    `metrics.jsonl`, for conditional (reference-available) tasks -- the counterpart of
+    `_seed_best_ppl`. Which metric field is read is config.eval_primary_metric-driven
+    ("bleu" by default, matching WMT14's existing behavior; "rougeL" etc. for
+    summarization tasks like XSum, where BLEU is not the standard metric). Unlike Gen.
+    PPL, these are directly scored against ground-truth references, so degenerate/empty
+    output can't score artificially high (it scores ~0) -- no plausibility filter is
+    needed here. Returns -inf if not applicable (no block mode, no prior history,
+    online_eval off, or the configured metric field was never recorded -- i.e. this is
+    an unconditional task).
     """
     if not (config.use_block_revelation and config.online_eval and config.sampling_configs):
         return float("-inf")
+    metric_key = getattr(config, "eval_primary_metric", "bleu")
     sc = config.sampling_configs[0]
     name = _build_run_name(
         sc.sampling_method, sc.num_sampling_steps[0], sc.cfgs[0],
@@ -142,9 +146,9 @@ def _seed_best_bleu(config):
                 entry = json.loads(line)
             except Exception:
                 continue
-            if not (isinstance(entry, dict) and "bleu" in entry):
+            if not (isinstance(entry, dict) and metric_key in entry):
                 continue
-            best = max(best, float(entry["bleu"]))
+            best = max(best, float(entry[metric_key]))
     return best
 
 
@@ -448,15 +452,20 @@ def run_training(config):
     best_ppl = _seed_best_ppl(config)
     if best_ppl < float("inf"):
         log_for_0(f"Best-checkpoint tracking seeded from existing history: best_ppl={best_ppl:.4f}")
+    eval_primary_metric = getattr(config, "eval_primary_metric", "bleu")
     best_bleu = _seed_best_bleu(config)
     if best_bleu > float("-inf"):
-        log_for_0(f"Best-checkpoint tracking seeded from existing history: best_bleu={best_bleu:.4f}")
+        log_for_0(
+            f"Best-checkpoint tracking seeded from existing history: "
+            f"best_{eval_primary_metric}={best_bleu:.4f}"
+        )
 
     def _maybe_save_best(state, step, ppl, entropy, bleu=None):
         nonlocal best_ppl, best_bleu
-        # Conditional (BLEU-scored) tasks: higher is better, no plausibility filter
-        # needed -- degenerate/empty output can't score artificially high against
-        # ground-truth references (unlike GPT2 Gen. PPL on unconditional tasks).
+        # Conditional tasks (BLEU or ROUGE, per config.eval_primary_metric): higher is
+        # better, no plausibility filter needed -- degenerate/empty output can't score
+        # artificially high against ground-truth references (unlike GPT2 Gen. PPL on
+        # unconditional tasks).
         if bleu is not None:
             if bleu <= best_bleu:
                 return
@@ -465,7 +474,7 @@ def run_training(config):
                 state, os.path.join(config.output_dir, "best"), step,
                 hf_repo_id=config.hf_repo_id, keep=1,
             )
-            log_for_0(f"New best checkpoint at step {step}: bleu={bleu:.4f}")
+            log_for_0(f"New best checkpoint at step {step}: {eval_primary_metric}={bleu:.4f}")
             return
         if not _is_plausible(ppl, entropy) or ppl >= best_ppl:
             return

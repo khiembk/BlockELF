@@ -230,7 +230,20 @@ def _run_block_generation(
                         f"ROUGE-2: {rouge_scores['rouge2']:.2f}  ROUGE-L: {rouge_scores['rougeL']:.2f}"
                     )
                     if sc_idx == 0:
-                        first_config_bleu = bleu_score
+                        # Which scored metric feeds best-checkpoint tracking --
+                        # "first_config_bleu" keeps its name (train.py's
+                        # _seed_best_bleu/_maybe_save_best read it generically as "the
+                        # higher-is-better conditional-task metric"), but its VALUE is
+                        # config.eval_primary_metric-driven: BLEU for WMT14 (default,
+                        # unchanged), ROUGE for summarization tasks like XSum.
+                        metric_name = getattr(config, "eval_primary_metric", "bleu")
+                        metric_values = {"bleu": bleu_score, **rouge_scores}
+                        if metric_name not in metric_values:
+                            raise ValueError(
+                                f"Unknown config.eval_primary_metric={metric_name!r}; "
+                                f"must be one of {sorted(metric_values)}"
+                            )
+                        first_config_bleu = metric_values[metric_name]
                 else:
                     nonempty = [s for s in hypotheses if isinstance(s, str) and s.strip()]
                     if nonempty:

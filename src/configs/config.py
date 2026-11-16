@@ -91,6 +91,17 @@ class Config:
     # use_staggered_noise=True (role-aware semantics don't apply either way).
     role_aware_uncond_attention: bool = True
 
+    # Which reference-scored metric to use for conditional-task best-checkpoint
+    # tracking (`_seed_best_bleu`/`_maybe_save_best` in train.py): "bleu", "rouge1",
+    # "rouge2", or "rougeL". Only read when references are available (conditional
+    # tasks with eval_data_path set); unconditional tasks always use Gen. PPL instead
+    # (see _seed_best_ppl). Default "bleu" preserves WMT14's existing behavior
+    # (translation quality is conventionally BLEU-scored). Summarization tasks like
+    # XSum should set this to "rougeL" -- ROUGE, not BLEU, is the standard metric for
+    # abstractive summarization; WMT14's config does not set this field, so it keeps
+    # scoring/selecting on BLEU unchanged.
+    eval_primary_metric: str = "bleu"
+
     # Decoder objective
     decoder_prob: float = 0.5  # Probability of decoder (CE) step vs denoiser (L2) step
     decoder_noise_scale: float = 1.0  # Scale of noise in logit-normal-noised latent for CE branch
