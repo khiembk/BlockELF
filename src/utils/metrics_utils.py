@@ -28,6 +28,25 @@ def compute_bleu(hypotheses, references):
     return sacrebleu.corpus_bleu(hypotheses, [references], lowercase=True, use_effective_order=True).score
 
 
+def compute_mauve(generated_texts, reference_texts, featurize_model_name="gpt2-large",
+                   max_text_length=1024, device_id=0, verbose=False, seed=25):
+    """MAUVE score (Pillutla et al. 2021) between a generated-text sample and a
+    reference (real-text) sample of the same domain -- unlike BLEU/ROUGE, this needs
+    no per-example alignment: it compares the two samples' distributions as a whole via
+    a quantized KL-divergence frontier over `featurize_model_name`-embedded text, so
+    it's meaningful for unconditional generation (no ground-truth continuation to
+    compare against). Returns the scalar MAUVE score in [0, 1] (higher = generated
+    distribution closer to the reference). Requires the `mauve-text` package.
+    """
+    import mauve
+    out = mauve.compute_mauve(
+        p_text=reference_texts, q_text=generated_texts,
+        featurize_model_name=featurize_model_name, max_text_length=max_text_length,
+        device_id=device_id, verbose=verbose, seed=seed,
+    )
+    return out.mauve
+
+
 def compute_rouge(hypotheses, references, return_std=False):
     from rouge_score import rouge_scorer
     scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
