@@ -36,14 +36,33 @@ def compute_mauve(generated_texts, reference_texts, featurize_model_name="gpt2-l
     a quantized KL-divergence frontier over `featurize_model_name`-embedded text, so
     it's meaningful for unconditional generation (no ground-truth continuation to
     compare against). Returns the scalar MAUVE score in [0, 1] (higher = generated
-    distribution closer to the reference). Requires the `mauve-text` package.
+    distribution closer to the reference). Requires the optional `mauve-text` package
+    (see requirements-eval-mauve.txt) -- NOT a dependency of training/inference; this
+    import is intentionally lazy (function-local) so importing this module, or any
+    other code path (training, PPL/entropy eval, BLEU/ROUGE), never requires `mauve`
+    to be installed.
     """
-    import mauve
+    try:
+        import mauve
+    except ImportError as e:
+        raise ImportError(
+            "compute_mauve() requires the optional 'mauve-text' package, which is not "
+            "installed in this environment. Install it with: pip install mauve-text "
+            "(see requirements-eval-mauve.txt). This is only needed for MAUVE "
+            "evaluation -- training and all other eval paths (PPL/entropy, BLEU/ROUGE) "
+            "do not depend on it."
+        ) from e
+    # p_text=reference (human/real) text, q_text=generated (model) text -- this is the
+    # orientation mauve.compute_mauve's own docs/API expect; reversing these would
+    # silently compute a technically-valid but semantically-backwards score.
     out = mauve.compute_mauve(
         p_text=reference_texts, q_text=generated_texts,
         featurize_model_name=featurize_model_name, max_text_length=max_text_length,
         device_id=device_id, verbose=verbose, seed=seed,
     )
+    # `out.mauve` is the MAUVE scalar itself -- NOT `out.frontier_integral` (a
+    # different, related-but-distinct quantity the same call also returns) and NOT a
+    # rescaled (e.g. *100) value.
     return out.mauve
 
 

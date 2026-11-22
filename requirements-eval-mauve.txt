@@ -1,0 +1,6 @@
+# Optional: only needed to run eval_mauve.py / utils.metrics_utils.compute_mauve.
+# NOT a dependency of training or any other eval path (PPL/entropy, BLEU/ROUGE) --
+# intentionally kept out of requirements.txt so MAUVE stays opt-in.
+#
+#   pip install -r requirements-eval-mauve.txt
+mauve-text==0.4.0
