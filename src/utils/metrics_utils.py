@@ -29,7 +29,7 @@ def compute_bleu(hypotheses, references):
 
 
 def compute_mauve(generated_texts, reference_texts, featurize_model_name="gpt2-large",
-                   max_text_length=1024, device_id=0, verbose=False, seed=25):
+                   max_text_length=768, device_id=0, verbose=False, seed=25):
     """MAUVE score (Pillutla et al. 2021) between a generated-text sample and a
     reference (real-text) sample of the same domain -- unlike BLEU/ROUGE, this needs
     no per-example alignment: it compares the two samples' distributions as a whole via
@@ -41,6 +41,29 @@ def compute_mauve(generated_texts, reference_texts, featurize_model_name="gpt2-l
     import is intentionally lazy (function-local) so importing this module, or any
     other code path (training, PPL/entropy eval, BLEU/ROUGE), never requires `mauve`
     to be installed.
+
+    `max_text_length` default changed from mauve-text's own default of 1024 to 768 --
+    NOT an arbitrary tuning choice. `mauve-text`'s GPT-2 featurizer represents each
+    text by its LAST token's hidden state only (not pooled/averaged). On OWT-scale
+    text (documents near/above the ~1024-token canvas, with real length variance), a
+    window AT OR ABOVE the natural document-length distribution means most texts never
+    get truncated, so each text's "last token" lands at a different, data-dependent
+    position -- comparing feature vectors from wildly different sequence positions
+    collapses MAUVE independent of generation quality. A window BELOW the bulk of the
+    length distribution forces nearly every text to be truncated at the SAME position,
+    making the comparison fair. Verified empirically on this exact checkpoint family:
+    pretrained OWT ELF went from MAUVE=0.21-0.34 at max_text_length=1024 to 0.79-0.86
+    at max_text_length=768 (matching the ~0.8-0.86 figure reported for this model) --
+    same text, same seed, only this one parameter changed. See the sibling CorrFlow
+    repo's commit b5b1d8f ("Fix OWT MAUVE measurement bug...") for the original
+    diagnosis, and this repo's own
+    tests/test_mauve_eval.py::test_mauve_truncation_window_bias_regression for a
+    from-scratch synthetic confirmation of the mechanism.
+    This default is appropriate for OWT-scale text; for much shorter text (e.g. LM1B,
+    where mean length is already far below 768) check your own length diagnostics
+    (`utils.mauve_eval_utils.text_length_stats`) before assuming 768 is still the
+    right choice -- a window far above the natural length distribution reintroduces
+    the exact same bias this default exists to avoid.
     """
     try:
         import mauve

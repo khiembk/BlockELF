@@ -241,6 +241,60 @@ def test_provenance_report_contains_required_fields():
           "empty/duplicate rates, protocol, library versions), and is JSON-serializable")
 
 
+def test_mauve_truncation_window_bias_regression():
+    """Regression test for the measurement bug found and fixed in this session
+    (compute_mauve's max_text_length default changed 1024 -> 768): mauve-text
+    featurizes each text by its LAST token's hidden state only, so a window AT OR
+    ABOVE the natural document-length distribution means almost nothing gets
+    truncated and each text's "last token" lands at a different, data-dependent
+    position -- this alone was measured to collapse real OWT MAUVE from ~0.8 to
+    ~0.2-0.3, independent of generation quality (see commit history / sibling
+    CorrFlow repo's b5b1d8f). This test isolates the mechanism synthetically: two
+    text samples built from the IDENTICAL style/content (same base passage repeated
+    a variable number of times), differing ONLY in their length *profile*
+    (reference: wide length variance, like real documents; "generated": narrow,
+    consistently near the top of the range, like a model filling its canvas). Since
+    content/style is indistinguishable by construction, any MAUVE difference between
+    the two window sizes below is attributable PURELY to the truncation-window
+    mechanism, not a real quality gap.
+    """
+    try:
+        import mauve  # noqa: F401
+    except ImportError:
+        print("[SKIP] mauve not installed -- skipping truncation-window regression test")
+        return
+
+    import random
+    base = ("The quick brown fox jumps over the lazy dog near the river bank. "
+            "Scientists announced a new discovery in the field of astrophysics today. ")
+    rng = random.Random(0)
+    reference_texts = [base * rng.randint(1, 20) for _ in range(100)]   # wide length variance
+    generated_texts = [base * rng.randint(18, 20) for _ in range(100)]  # narrow, near-max length
+
+    score_no_truncation = compute_mauve(
+        generated_texts=generated_texts, reference_texts=reference_texts,
+        featurize_model_name="gpt2", max_text_length=600, device_id=-1, seed=42,
+    )
+    score_consistent_truncation = compute_mauve(
+        generated_texts=generated_texts, reference_texts=reference_texts,
+        featurize_model_name="gpt2", max_text_length=150, device_id=-1, seed=42,
+    )
+    print(f"[INFO] same content/style, max_text_length=600 (no truncation): "
+          f"MAUVE={score_no_truncation:.4f}")
+    print(f"[INFO] same content/style, max_text_length=150 (consistent truncation): "
+          f"MAUVE={score_consistent_truncation:.4f}")
+    assert score_consistent_truncation > score_no_truncation + 0.2, (
+        "a smaller max_text_length that forces consistent truncation should score "
+        f"substantially higher than one that doesn't, on IDENTICAL-style text -- got "
+        f"{score_consistent_truncation:.4f} (K=150) vs {score_no_truncation:.4f} (K=600); "
+        "if this fails, the max_text_length default may need re-validating, not "
+        "just this test's thresholds"
+    )
+    print("[OK] truncation-window regression: a too-large max_text_length measurably "
+          "collapses MAUVE on same-style text purely via the last-token-position "
+          "mechanism, confirming why the default was changed from 1024 to 768")
+
+
 def test_mauve_identical_distribution_smoke():
     try:
         import mauve  # noqa: F401
@@ -299,5 +353,6 @@ if __name__ == "__main__":
     test_compute_mauve_raises_clear_error_when_mauve_not_installed()
     test_validate_reference_split_args()
     test_provenance_report_contains_required_fields()
+    test_mauve_truncation_window_bias_regression()
     test_mauve_identical_distribution_smoke()
     print("\nAll MAUVE eval sanity tests passed.")

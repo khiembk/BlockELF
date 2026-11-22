@@ -72,10 +72,19 @@ def parse_args():
                    help="How many real-text examples to sample as the reference set. "
                         "Defaults to the generated sample's size (recommended: equal sizes).")
     p.add_argument("--featurize_model_name", type=str, default="gpt2-large")
-    p.add_argument("--max_text_length", type=int, default=1024,
+    p.add_argument("--max_text_length", type=int, default=768,
                    help="MAUVE judge truncation window, measured in the featurizer's OWN "
                         "(GPT-2) tokenization -- not T5 tokens. Must match across any scores "
-                        "being compared to each other.")
+                        "being compared to each other. Default 768 (not mauve-text's own "
+                        "default of 1024): mauve-text featurizes each text by its LAST "
+                        "token's hidden state only, so a window AT OR ABOVE the natural "
+                        "document-length distribution means almost nothing gets truncated and "
+                        "each text's 'last token' lands at a different, data-dependent "
+                        "position -- this alone was measured to collapse MAUVE from ~0.8 to "
+                        "~0.2-0.3 on OWT-scale text, independent of generation quality. See "
+                        "utils.metrics_utils.compute_mauve's docstring. If your text is much "
+                        "shorter than 768 (e.g. LM1B), check --generated length diagnostics "
+                        "(printed below) before assuming 768 is still the right choice.")
     p.add_argument("--device_id", type=int, default=0,
                    help="GPU device index for MAUVE's GPT-2 featurizer; -1 for CPU.")
     p.add_argument("--seed", type=int, default=42,
@@ -152,6 +161,27 @@ def main():
     log_for_0(f"Reference empty/duplicate fraction: "
               f"{report['reference']['empty_fraction']:.4f} / {report['reference']['duplicate_fraction']:.4f}")
     log_for_0("=" * 60)
+
+    # Protective check for the exact bug class documented in compute_mauve's docstring:
+    # mauve-text featurizes each text by its LAST token only, so if --max_text_length
+    # is at/above most texts' natural length, almost nothing gets truncated and each
+    # text's "last token" lands at a different, data-dependent position -- this alone
+    # was measured to collapse MAUVE from ~0.8 to ~0.2-0.3 on OWT, independent of
+    # quality. A LOW truncation fraction here is the warning sign (the window isn't
+    # doing its job of forcing a consistent last-token position), not a high one.
+    gen_trunc = report["generated"]["truncated_by_judge_window_fraction"]
+    ref_trunc = report["reference"]["truncated_by_judge_window_fraction"]
+    if gen_trunc < 0.5 or ref_trunc < 0.5:
+        log_for_0(
+            f"WARNING: only {gen_trunc:.1%} of generated / {ref_trunc:.1%} of reference texts "
+            f"were actually truncated by max_text_length={args.max_text_length} -- most texts are "
+            f"shorter than this window, so their MAUVE 'last token' position is data-dependent "
+            f"rather than forced consistent. This is the exact mechanism that collapsed OWT's "
+            f"MAUVE from ~0.8 to ~0.2-0.3 at the wrong window size (see compute_mauve's "
+            f"docstring). If this score looks suspiciously low, try a SMALLER "
+            f"--max_text_length (below the bulk of both length distributions above) before "
+            f"concluding it reflects real quality."
+        )
 
     if args.report_path:
         with open(args.report_path, "w", encoding="utf-8") as f:
