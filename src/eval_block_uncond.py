@@ -56,10 +56,31 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=20)
     p.add_argument("--num_sampling_steps", type=int, default=None,
                     help="Override sampling_config.num_sampling_steps[0] (faster eval with fewer steps).")
+    p.add_argument("--self_cond_cfg_scale", type=float, default=None,
+                    help="Override sampling_config.self_cond_cfg_scales[0]. NOTE: for configs with "
+                         "num_self_cond_cfg_tokens > 0 (e.g. OWT), this is an in-context conditioning "
+                         "VALUE fed to the model (trained range [self_cond_cfg_min, self_cond_cfg_max], "
+                         "typically [0.5, 5.0]) -- NOT classifier-free-guidance interpolation. 1.0 is "
+                         "not an 'unguided' baseline in that case; see sampling_utils.py's "
+                         "_forward_sample_self_cond for the exact branch actually taken.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--print_examples", type=int, default=5)
     p.add_argument("--out_path", type=str, default=None,
                     help="Optional path to write generated samples as JSONL.")
+    p.add_argument("--run_manifest_path", type=str, default=None,
+                    help="Optional path to save this run's exact config (checkpoint, seed, sampling "
+                         "config, decoder settings) as JSON, for reproducible ablation record-keeping.")
+    p.add_argument("--owt_decoder_mode", type=str, default="greedy",
+                    choices=["greedy", "categorical", "top_p"],
+                    help="OWT-only opt-in decoder sampling ablation (see "
+                         "utils.generation_utils._sample_decoder_tokens). Default 'greedy' is the "
+                         "exact original argmax path, bit-for-bit, for every other config/task.")
+    p.add_argument("--owt_decoder_temperature", type=float, default=1.0,
+                    help="Softmax temperature for --owt_decoder_mode categorical/top_p. No effect in "
+                         "greedy mode.")
+    p.add_argument("--owt_decoder_top_p", type=float, default=1.0,
+                    help="Nucleus mass threshold for --owt_decoder_mode top_p. No effect in "
+                         "greedy/categorical mode.")
     return p.parse_args()
 
 
@@ -73,12 +94,16 @@ def main():
     sampling_config = config.sampling_configs[0]
     if args.num_sampling_steps is not None:
         sampling_config.num_sampling_steps = [args.num_sampling_steps]
+    if args.self_cond_cfg_scale is not None:
+        sampling_config.self_cond_cfg_scales = [args.self_cond_cfg_scale]
 
     log_for_0(f"Checkpoint: {args.checkpoint_path}")
     log_for_0(f"block_size={config.block_size}, use_block_revelation={config.use_block_revelation}")
     log_for_0(f"sampling_config={sampling_config}")
     log_for_0(f"role_aware_attention (auto): "
               f"{config.use_block_revelation and not config.use_staggered_noise and getattr(config, 'role_aware_uncond_attention', True)}")
+    log_for_0(f"owt_decoder_mode={args.owt_decoder_mode} "
+              f"temperature={args.owt_decoder_temperature} top_p={args.owt_decoder_top_p}")
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name or config.encoder_model_name)
 
@@ -134,6 +159,9 @@ def main():
             state=state, encoder_params=encoder_params, encoder_apply_fn=encoder_model.apply,
             tokenizer=tokenizer, config=config, sampling_config=sampling_config,
             batch_size=cur_batch, rng=gen_rng,
+            decoder_mode=args.owt_decoder_mode,
+            decoder_temperature=args.owt_decoder_temperature,
+            decoder_top_p=args.owt_decoder_top_p,
         )
         hypotheses.extend(texts)
         samples_done += len(texts)
@@ -170,6 +198,30 @@ def main():
             for i, text in enumerate(hypotheses):
                 f.write(json.dumps({"id": i, "generated": text}, ensure_ascii=False) + "\n")
         log_for_0(f"Saved {len(hypotheses)} generated texts to {args.out_path}")
+
+    if args.run_manifest_path:
+        manifest = {
+            "checkpoint_path": args.checkpoint_path, "loaded_step": loaded_step,
+            "config_path": args.config, "config_override": args.config_override,
+            "seed": args.seed, "num_samples": args.num_samples, "batch_size": args.batch_size,
+            "sampling_method": sampling_config.sampling_method,
+            "num_sampling_steps": sampling_config.num_sampling_steps,
+            "cfgs": sampling_config.cfgs, "self_cond_cfg_scales": sampling_config.self_cond_cfg_scales,
+            "sde_gamma": getattr(sampling_config, "sde_gamma", None),
+            "time_schedule": sampling_config.time_schedule,
+            "owt_decoder_mode": args.owt_decoder_mode,
+            "owt_decoder_temperature": args.owt_decoder_temperature,
+            "owt_decoder_top_p": args.owt_decoder_top_p,
+            "role_aware_uncond_attention": getattr(config, "role_aware_uncond_attention", True),
+            "out_path": args.out_path,
+            "n_hypotheses": len(hypotheses), "empty_count": empty_count,
+            "gen_ppl": ppl_results["ppl"] if ppl_results is not None else None,
+            "mean_entropy": ppl_results["mean_entropy"] if ppl_results is not None else None,
+        }
+        os.makedirs(os.path.dirname(args.run_manifest_path) or ".", exist_ok=True)
+        with open(args.run_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        log_for_0(f"Saved run manifest to {args.run_manifest_path}")
 
 
 if __name__ == "__main__":

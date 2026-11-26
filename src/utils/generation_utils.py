@@ -161,8 +161,15 @@ def _generate_samples_single_batch(
     return z
 
 
-def _dlm_decode_batch(z, model_params, model_apply_fn, t_final_val, config, self_cond_cfg_scale):
-    """Decode z→tokens with the DLM decoder head."""
+def _dlm_decode_logits_batch(z, model_params, model_apply_fn, t_final_val, config, self_cond_cfg_scale):
+    """Shared DLM-decoder-head forward pass; returns raw `decoder_logits` (not argmax)
+    so callers can choose argmax (the default/legacy path, via `_dlm_decode_batch`
+    below) or a sampling distribution (OWT-only opt-in, via `_sample_decoder_tokens`)
+    without duplicating this forward pass. `_dlm_decode_batch`'s own signature/behavior
+    is unchanged by this refactor -- it just now delegates here internally -- so every
+    existing caller (`generate_block_cond`, `generate_block_uncond`'s greedy default,
+    and the `jax.pmap`-wrapped `_make_pmap_pair` path) is unaffected.
+    """
     batch_size = z.shape[0]
     t_final = jnp.full((batch_size,), t_final_val, dtype=z.dtype)
     self_cond_cfg_scale_batch = (
@@ -176,7 +183,54 @@ def _dlm_decode_batch(z, model_params, model_apply_fn, t_final_val, config, self
         self_cond_cfg_scale=self_cond_cfg_scale_batch,
         decoder_step_active=jnp.array(True),
     )
+    return decoder_logits
+
+
+def _dlm_decode_batch(z, model_params, model_apply_fn, t_final_val, config, self_cond_cfg_scale):
+    """Decode z→tokens with the DLM decoder head (argmax). Default/legacy path for
+    every caller; signature and behavior unchanged from before the
+    `_dlm_decode_logits_batch` refactor above."""
+    decoder_logits = _dlm_decode_logits_batch(
+        z=z, model_params=model_params, model_apply_fn=model_apply_fn,
+        t_final_val=t_final_val, config=config, self_cond_cfg_scale=self_cond_cfg_scale,
+    )
     return jnp.argmax(decoder_logits, axis=-1)
+
+
+def _sample_decoder_tokens(decoder_logits, rng, mode, temperature=1.0, top_p=1.0):
+    """OWT-only opt-in decoder sampling (NOT used by `_dlm_decode_batch`/the default
+    greedy path, nor by `generate_block_cond`/WMT14/XSum). Caller is expected to
+    pre-slice `decoder_logits` to only the positions it actually wants sampled (e.g.
+    just this round's newly-committed block) -- this function samples every position
+    it's given, independently, via a single `rng` (JAX's categorical/Gumbel-max
+    sampling already draws independent noise per position from one key; no manual
+    per-position key-splitting is needed for independence).
+
+    mode='categorical': sample from softmax(logits / temperature).
+    mode='top_p' (nucleus): sort descending, keep the smallest prefix whose cumulative
+    probability >= top_p (always keeping at least the single highest-probability
+    token), mask the rest to -inf, renormalize implicitly via categorical sampling over
+    the masked logits, then map back to original vocab ids.
+    """
+    assert mode in ("categorical", "top_p"), f"_sample_decoder_tokens: unsupported mode {mode!r}"
+    scaled_logits = decoder_logits / jnp.maximum(temperature, 1e-6)
+    if mode == "categorical":
+        return jax.random.categorical(rng, scaled_logits, axis=-1)
+
+    # top_p (nucleus) sampling.
+    sorted_order = jnp.argsort(scaled_logits, axis=-1)[..., ::-1]  # descending
+    sorted_logits = jnp.take_along_axis(scaled_logits, sorted_order, axis=-1)
+    sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+    cumprobs = jnp.cumsum(sorted_probs, axis=-1)
+    # Keep position i iff everything strictly before it has cumulative prob < top_p --
+    # i.e. position i is needed to cross the top_p threshold. Position 0 (the single
+    # highest-probability token) is always kept, even if top_p is tiny.
+    keep = (cumprobs - sorted_probs) < top_p
+    keep = keep.at[..., 0].set(True)
+    neg_inf = jnp.finfo(sorted_logits.dtype).min
+    filtered_sorted_logits = jnp.where(keep, sorted_logits, neg_inf)
+    sampled_sorted_pos = jax.random.categorical(rng, filtered_sorted_logits, axis=-1)
+    return jnp.take_along_axis(sorted_order, sampled_sorted_pos[..., None], axis=-1)[..., 0]
 
 
 # ============================================
@@ -435,8 +489,25 @@ def generate_block_uncond(
     batch_size: int,
     rng: PRNGKey,
     use_ema: bool = True,
+    decoder_mode: str = "greedy",
+    decoder_temperature: float = 1.0,
+    decoder_top_p: float = 1.0,
 ):
     """Block-to-block unconditional generation (single device, eager Python loop).
+
+    decoder_mode/decoder_temperature/decoder_top_p: OWT-only opt-in decoder-sampling
+    ablation (see `_sample_decoder_tokens`), investigating OWT's long-canvas repetition
+    collapse. Default `decoder_mode="greedy"` is the exact original `_dlm_decode_batch`
+    argmax path -- bit-for-bit unchanged, and critically does NOT consume any
+    additional `rng` split, so the noise/timestep RNG sequence seen by every other
+    caller (and by this function itself in greedy mode) is identical to before this
+    parameter existed. Only `decoder_mode in ("categorical", "top_p")` draws an extra
+    `rng` split, and only for sampling this round's `block_size`-wide newly-committed
+    window (not the full canvas) -- positions outside that window are irrelevant
+    (they get overwritten by the existing `jnp.where(newly_committed, ...)` logic
+    below regardless of what's sampled there), so restricting the sort/softmax cost to
+    that window avoids an unnecessary O(canvas_length) sampling cost per round.
+    Never changes `generate_block_cond` (WMT14/XSum) or any other caller.
 
     Unconditional analogue of `generate_block_cond`: there is no source prefix, so the
     full `config.max_length` canvas is the target set `A_0` on round 0 (matching the
@@ -493,8 +564,12 @@ def generate_block_uncond(
     committed_len = jnp.zeros((batch_size,), dtype=jnp.int32)
     finished = jnp.zeros((batch_size,), dtype=bool)
 
+    assert decoder_mode in ("greedy", "categorical", "top_p"), (
+        f"generate_block_uncond: unsupported decoder_mode={decoder_mode!r}"
+    )
+
     max_rounds = (canvas_length + block_size - 1) // block_size
-    for _ in range(max_rounds):
+    for round_idx in range(max_rounds):
         if bool(jnp.all(finished | (committed_len >= canvas_length))):
             break
 
@@ -537,10 +612,33 @@ def generate_block_uncond(
             cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
             **extra_sampler_kwargs,
         )
-        predicted_ids = _dlm_decode_batch(
-            z=z_final, model_params=model_params, model_apply_fn=model_apply_fn,
-            t_final_val=t_steps[-1], config=config, self_cond_cfg_scale=self_cond_cfg_scale,
-        )
+        if decoder_mode == "greedy":
+            # Exact original path -- no extra rng split consumed, so this branch's RNG
+            # stream (and therefore every subsequent round's noise/timestep sampling)
+            # is bit-for-bit identical to before decoder_mode existed.
+            predicted_ids = _dlm_decode_batch(
+                z=z_final, model_params=model_params, model_apply_fn=model_apply_fn,
+                t_final_val=t_steps[-1], config=config, self_cond_cfg_scale=self_cond_cfg_scale,
+            )
+        else:
+            # OWT-only opt-in sampling. Restrict the categorical/top-p sort cost to
+            # this round's block_size-wide newly-committed window -- positions outside
+            # it are discarded by the `jnp.where(newly_committed, ...)` logic below and
+            # by the final committed_len cleanup regardless of what's sampled there, so
+            # there's no correctness reason to pay the O(canvas_length) sampling cost.
+            rng, decode_rng = jax.random.split(rng)
+            decoder_logits = _dlm_decode_logits_batch(
+                z=z_final, model_params=model_params, model_apply_fn=model_apply_fn,
+                t_final_val=t_steps[-1], config=config, self_cond_cfg_scale=self_cond_cfg_scale,
+            )
+            window_start = round_idx * block_size
+            window_end = min(window_start + block_size, canvas_length)
+            sampled_window_ids = _sample_decoder_tokens(
+                decoder_logits[:, window_start:window_end, :], decode_rng,
+                mode=decoder_mode, temperature=decoder_temperature, top_p=decoder_top_p,
+            )
+            predicted_ids = jnp.zeros((batch_size, canvas_length), dtype=jnp.int32)
+            predicted_ids = predicted_ids.at[:, window_start:window_end].set(sampled_window_ids)
 
         # Commit the next `block_size` tokens of the active region (left-to-right).
         commit_upto = jnp.minimum(committed_len + block_size, canvas_length)
