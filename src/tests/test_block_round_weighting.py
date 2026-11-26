@@ -20,6 +20,20 @@ blocks that are barely ever supervised, because by the time k exceeds a small j,
 has already been teacher-forced (committed, not noised) for the rest of that round's
 possible k values.
 
+**CORRECTION (post-review, see docs/owt_collapse_root_cause_findings.md's T1 section):**
+the 303.6x figure above assumes `reduce_token_loss` normalizes PER EXAMPLE. It does not --
+`train_step.py::reduce_token_loss` divides by `loss_mask.sum()` with NO axis argument,
+pooling the ENTIRE per-device minibatch's active-token count into one shared scalar
+denominator. A corrected Monte Carlo simulation using the real OWT per-device batch size
+(12, from global_batch_size=24 / 2 local devices) and the real OWT target-length
+distribution (sampled directly from the dataset) gives an effective late-vs-early ratio
+of **~70x, not ~304x** -- the qualitative imbalance (late blocks dominate) is real and
+confirmed, but this file's own per-example-isolated w_j significantly OVERSTATES its
+magnitude. See `tests/test_block_round_zero_mix.py`'s
+`test_batch_pooled_weighting_imbalance_shrinks_with_rho` for the corrected, batch-pooled
+simulation (and confirmation that T1's `rho` mixture still shrinks the REAL imbalance,
+just from a smaller starting point than originally claimed).
+
 train.py's `compute_block_round_counts`/`sample_weights` corrects a DIFFERENT, orthogonal
 bias (which EXAMPLE gets drawn into a batch, proportional to K_i, canceling the
 small-K_i-examples-are-overrepresented-at-k=0 effect across the corpus) -- it does NOT

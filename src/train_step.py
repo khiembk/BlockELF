@@ -89,6 +89,7 @@ def train_step(
         else:
             committed_mask_2d, active_mask_2d, boundary = sample_block_round(
                 block_rng, batch["cond_seq_mask"], batch["attention_mask"], config.block_size,
+                rho=getattr(config, "block_round_zero_mix", 0.0),
             )
             clean_mask = jnp.maximum(cond_seq_mask, committed_mask_2d[:, :, None])
             loss_mask = active_mask_2d
@@ -356,4 +357,23 @@ def train_step(
         "ce_loss": active_ce_loss_val,
         "active_frac": jax.lax.pmean(loss_mask.mean(), axis_name="batch"),
     }
+
+    # Round-sampling curriculum metrics (block_round_zero_mix / T1 diagnostics, see
+    # docs/owt_collapse_root_cause_findings.md): only meaningful on the fixed-block
+    # (non-staggered) path, where `boundary` is actually the per-example round-k
+    # commit boundary. Logged unconditionally on that path (regardless of rho) so
+    # rho=0 runs get the same visibility into the historical k-distribution.
+    if config.use_block_revelation and not config.use_staggered_noise:
+        cond_len_for_metrics = batch["cond_seq_mask"].sum(axis=1)
+        k_vals = (boundary - cond_len_for_metrics) / config.block_size
+        metrics["frac_k0"] = jax.lax.pmean(jnp.mean(k_vals < 0.5), axis_name="batch")
+        metrics["mean_k"] = jax.lax.pmean(jnp.mean(k_vals), axis_name="batch")
+        metrics["frac_k_1_to_7"] = jax.lax.pmean(
+            jnp.mean((k_vals >= 0.5) & (k_vals < 7.5)), axis_name="batch",
+        )
+        metrics["frac_k_8_to_31"] = jax.lax.pmean(
+            jnp.mean((k_vals >= 7.5) & (k_vals < 31.5)), axis_name="batch",
+        )
+        metrics["frac_k_32_plus"] = jax.lax.pmean(jnp.mean(k_vals >= 31.5), axis_name="batch")
+
     return new_state, metrics

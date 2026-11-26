@@ -67,6 +67,12 @@ class Config:
     use_block_revelation: bool = False
     block_size: int = 16  # Fixed commit size b
 
+    # OWT-only opt-in round-sampling curriculum (Stage-1 repetition-collapse follow-up,
+    # see docs/owt_collapse_root_cause_findings.md). Default 0.0 reproduces the exact
+    # original k ~ Uniform{0,...,K_i-1} draw, bit-for-bit -- no config needs to change
+    # to keep existing behavior. See utils/block_utils.sample_block_round's `rho` arg.
+    block_round_zero_mix: float = 0.0
+
     # Staggered-noise training — a faithful port of SetDLM's StaggeredNoise schedule
     # (see utils/block_utils.compute_staggered_timesteps / _staggered_bk), only
     # meaningful when use_block_revelation is also True. Replaces the discrete

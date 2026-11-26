@@ -7,6 +7,7 @@ import json
 import yaml
 import logging
 import os
+import subprocess
 import sys
 import time
 from functools import partial
@@ -152,6 +153,56 @@ def _seed_best_bleu(config):
     return best
 
 
+def _log_reproducibility_header(config):
+    """Phase 0 reproducibility logging (docs/owt_collapse_root_cause_findings.md's
+    follow-up spec): git SHA + dirty status, effective config (as loaded, including any
+    --config_override applied), and the PRNG seed, all logged BEFORE any training
+    happens so a run's exact code+config state is reconstructible from its log alone.
+    Read-only (git status/diff, no mutation); never raises -- a git failure (e.g. this
+    checkout isn't a repo, or git isn't installed) degrades to a logged warning, not a
+    crashed training run.
+    """
+    log_for_0("=" * 60)
+    log_for_0("Reproducibility header")
+    log_for_0("=" * 60)
+    try:
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty_files = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo_dir, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        log_for_0(f"Git SHA: {sha}")
+        if dirty_files:
+            log_for_0(f"Git status: DIRTY ({len(dirty_files.splitlines())} changed paths):")
+            for line in dirty_files.splitlines():
+                log_for_0(f"  {line}")
+        else:
+            log_for_0("Git status: clean")
+    except Exception as e:
+        log_for_0(f"Git reproducibility info unavailable ({type(e).__name__}: {e})")
+
+    log_for_0(f"PRNG seed: {config.seed}")
+    log_for_0(f"Resume path: {config.resume}")
+    log_for_0(f"Warm-start checkpoint: {config.warm_start_checkpoint}")
+    effective_config = {k: getattr(config, k) for k in dir(config) if not k.startswith("_")}
+    # yaml.dump chokes on non-primitive values (e.g. SamplingConfig objects); stringify
+    # anything it can't represent natively rather than dropping fields silently.
+    def _safe(v):
+        if isinstance(v, (int, float, str, bool, type(None))):
+            return v
+        if isinstance(v, (list, tuple)):
+            return [_safe(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): _safe(x) for k, x in v.items()}
+        return str(v)
+    effective_config = {k: _safe(v) for k, v in effective_config.items()}
+    log_for_0("Effective config (as loaded, overrides applied):")
+    log_for_0(yaml.dump(effective_config, default_flow_style=False, sort_keys=True))
+    log_for_0("=" * 60)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train ELF Diffusion Model (JAX).")
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file to override defaults.")
@@ -166,6 +217,7 @@ def parse_args():
 # Main Training Loop
 # ============================================
 def run_training(config):
+    _log_reproducibility_header(config)
 
     # Print configuration
     log_for_0("=" * 60)
@@ -360,6 +412,13 @@ def run_training(config):
         except Exception as e:
             log_for_0(f"Error loading checkpoint: {e}")
             log_for_0("Continuing training from scratch")
+
+    log_for_0(
+        "Checkpoint/optimizer-state provenance: "
+        f"starting_step={resume_step}, "
+        f"params/ema_source={'resume:' + config.resume if config.resume else ('warm_start:' + str(config.warm_start_checkpoint) if config.warm_start_checkpoint else 'random_init')}, "
+        f"opt_state={'resumed' if config.resume else 'fresh (warm-start never carries opt_state)'}"
+    )
 
     state = jax_utils.replicate(state)
     p_train_step = jax.pmap(

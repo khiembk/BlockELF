@@ -48,6 +48,15 @@ the degenerate encoder attention computed.
 ### §1.3 — Training-objective positional-weight imbalance: confirmed real, large, and
 in the OPPOSITE direction from "the model doesn't learn late positions"
 
+> **CORRECTION (see `docs/owt_t1_round_curriculum_implementation.md`):** the `w_j`
+> derivation below assumes `reduce_token_loss` normalizes per example. It does not — it
+> pools the WHOLE per-device minibatch into one scalar denominator. A corrected,
+> batch-pooled simulation using the real per-device batch size (12) and real OWT length
+> distribution gives an effective ratio of **~70x, not ~304x**. The qualitative
+> conclusion (late blocks dominate) still holds; the exact multiplier below is
+> overstated by ~4.3x. Left in place below for the historical derivation, not as the
+> corrected figure.
+
 `sample_block_round` draws `k ~ Uniform{0,...,K-1}`; `reduce_token_loss` averages the
 per-token loss uniformly over that round's active region. The expected per-token loss
 weight for a token in target block `j` (0-indexed), marginalizing over the `K` equally-
@@ -419,3 +428,10 @@ second, both at matched N≥1000 protocol) on the resulting checkpoint to confir
 actually closes the gap rather than just shifting it. **This requires your explicit
 approval before any training is launched**, per the non-negotiables governing this
 entire investigation.
+
+**Update**: step (1) is now implemented, tested, and corrected for a batch-pooling flaw
+caught in independent review — see `docs/owt_t1_round_curriculum_implementation.md` for
+the opt-in `block_round_zero_mix` code, its 6 regression/distribution tests, the
+corrected effective-weighting simulation (~70x, not ~304x), and the Phase 0
+reproducibility harness added to `train.py`. Steps (2)/(3) — actually training and
+evaluating T0/T1a/T1b pilots — are still not started.

@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 
-def sample_block_round(rng, cond_seq_mask, attention_mask, block_size: int):
+def sample_block_round(rng, cond_seq_mask, attention_mask, block_size: int, rho: float = 0.0):
     """Sample a per-example committed/active split for one block-revelation round.
 
     Args:
@@ -21,6 +21,19 @@ def sample_block_round(rng, cond_seq_mask, attention_mask, block_size: int):
         cond_seq_mask: (B, S) float/bool, 1 at source ("cond") positions.
         attention_mask: (B, S) float/bool, 1 at any valid (non-pad) position.
         block_size: fixed commit size b (>=1).
+        rho: OWT-only opt-in round-sampling curriculum mix, in [0, 1]. Default 0.0
+            reproduces the EXACT original single-uniform-draw code path (same PRNG
+            consumption, same outputs, bit-for-bit) -- every existing caller/config is
+            therefore unaffected unless it explicitly opts in. When rho > 0, k is drawn
+            from the mixture q_rho(k|K_i) = (1-rho)/K_i + rho*1[k=0]: with probability
+            rho, k is forced to 0 (never-yet-revealed-anything round); otherwise k is
+            drawn exactly as before, k ~ Uniform{0,...,K_i-1}. This directly counters
+            the late-round-heavy effective training weight documented in
+            docs/owt_collapse_root_cause_findings.md section on round-sampling
+            imbalance -- see that doc's corrected (batch-pooled, not per-example)
+            simulation of the actual effect size. Does not touch committed_mask/
+            active_mask/boundary semantics, encoder masking, or any loss computation;
+            only shifts which k gets sampled before those are built from it.
 
     Returns:
         committed_mask: (B, S) float32, 1 at source + committed-target positions
@@ -39,10 +52,18 @@ def sample_block_round(rng, cond_seq_mask, attention_mask, block_size: int):
     target_len = jnp.maximum(total_len - cond_len, 0.0)
     target_len_safe = jnp.maximum(target_len, 1.0)
 
-    # K_i = ceil(target_len_i / b) rounds; k sampled uniformly from [0, K_i).
+    # K_i = ceil(target_len_i / b) rounds; k sampled uniformly from [0, K_i) by default.
     num_rounds = jnp.ceil(target_len_safe / block_size)
-    u = jax.random.uniform(rng, cond_len.shape)
-    k = jnp.floor(u * num_rounds)
+    if rho == 0.0:
+        # Exact original code path -- unchanged PRNG consumption/outputs.
+        u = jax.random.uniform(rng, cond_len.shape)
+        k = jnp.floor(u * num_rounds)
+    else:
+        rng_u, rng_mix = jax.random.split(rng)
+        u = jax.random.uniform(rng_u, cond_len.shape)
+        k_uniform = jnp.floor(u * num_rounds)
+        force_zero = jax.random.bernoulli(rng_mix, rho, cond_len.shape)
+        k = jnp.where(force_zero, jnp.zeros_like(k_uniform), k_uniform)
     committed_target_len = k * block_size            # < target_len_safe whenever target_len > 0
 
     boundary = cond_len + committed_target_len        # (B,)
